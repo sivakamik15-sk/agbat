@@ -1,322 +1,341 @@
 <#
-    diagnose-BulkCsv.ps1 - find out why Bulk API 2.0 rejected a CSV.
-
-    WHY THIS EXISTS
-    Bulk API 2.0 reports a rejected load as
+    check-AgentSales.ps1 - one-click diagnosis of the AgentSalesUpsert failure
 
         InvalidBatch : Field name not found : 399700
 
-    and 399700 is not a field name at all - it is a data value from somewhere in
-    the body. That error means the server's CSV parser LOST SYNC with the row
-    boundaries, so a value ended up where a column name was expected. The
-    message names the value it tripped over, never the row it came from, which
-    makes it useless for locating the defect.
+    Just run it. No arguments, no paths to type. It knows where everything is.
 
-    Counting commas per line does not find it either, because the three things
-    that cause it are exactly the three things a naive line-by-line comma count
-    cannot see:
+    WHAT IT LOOKS AT, and why each one matters
 
-        1. a row with more or fewer fields than the header
-        2. an unbalanced double quote - from there on, newlines are swallowed
-           into one field and every following row boundary is wrong
-        3. an embedded line break inside a quoted field
+      1. C:\NLG\Source Data\AgentSales\Agentsalesdatasalesforce.csv
+         The file you are trying to load now.
 
-    So this script walks the file character by character with the same quoting
-    state machine the server uses. That is the only way to see records as the
-    server sees them, and it is why this finds the row that a comma count
-    misses.
+      2. C:\NLG\Load Result\AgentSalesUpsert_input.csv
+         The file the loader actually SENT to Salesforce, after the SDL header
+         rewrite. If 1 is clean and 2 is not, the defect was introduced by the
+         prepare step, not by the extract. Nothing else distinguishes those two
+         cases.
 
-    WHAT IT CHECKS
-      - BOM, byte size, line-ending style (CRLF / LF / mixed)
-      - header field count, and every record whose field count differs
-      - unbalanced quote, with the line it starts on
-      - records that span more than one physical line
-      - control characters, 0x1A (Ctrl-Z) called out separately because it is
-        what silently truncated a 100,000-row file to 65,535 once before
-      - duplicate values in the external-id column, which upsert resolves by
-        letting the LAST row win, silently
-      - optional: diff against a known-good copy (e.g. the archived file from
-        the run that worked)
+      3. The newest copy of the same filename under C:\NLG\Archive
+         Your bat archives the source CSV when a job SUCCEEDS, so this is the
+         file from the run that worked. Comparing it against 1 is what answers
+         "why did it fail this time when it ran fine last time".
 
-    USAGE
-      .\diagnose-BulkCsv.ps1
-          asks for the CSV path
+    HOW IT FINDS WHAT COMMA-COUNTING CANNOT
+    "Field name not found : 399700" means the server's CSV parser lost the row
+    boundaries and read a data value where a column name belonged. 399700 sits
+    at B2506 - deep in the body, not in the header. A line-by-line comma count
+    cannot see this, because the three causes are exactly the three things that
+    break the line/record relationship:
 
-      .\diagnose-BulkCsv.ps1 -Csv 'C:\NLG\Source Data\AgentSales\Agentsalesdatasalesforce.csv'
+        - an unbalanced double quote: from there on, newlines are swallowed
+          into one field and every later row boundary is wrong
+        - a record with more or fewer fields than the header
+        - a line break embedded inside a quoted field
 
-      # compare against the copy that loaded successfully
-      .\diagnose-BulkCsv.ps1 -Csv '...\Agentsalesdatasalesforce.csv' `
-                             -Against 'C:\NLG\Archive\Archive_0830 ...\Agentsalesdatasalesforce.csv'
+    So this walks the bytes with the same quoting state machine the server
+    uses, and reports RECORDS rather than lines. That is also why the loader's
+    row-count guard passed 10000/10000 and still let a broken file through: the
+    LINE count was right, the RECORD count was not, and nothing was checking it.
 
-      # also report duplicates in the upsert key
-      .\diagnose-BulkCsv.ps1 -Csv '...\file.csv' -ExtIdColumn ProducerID
+    IT NEVER WRITES TO THE CSVs. Read-only. The only file it creates is its own
+    report, so you can paste the results without retyping:
 
-    Read-only. It never writes to or modifies the CSV.
+        C:\NLG\Log\AgentSales-csv-check.txt
+
+    BEFORE YOU RUN IT: close the CSV in Excel, and do not save it. Excel had it
+    open; an Excel round-trip re-quotes fields and reformats numbers, and is a
+    common way this damage gets introduced.
 #>
 
-[CmdletBinding()]
-param(
-    [string] $Csv,
-    [string] $Against,
-    [string] $ExtIdColumn,
-    [int]    $MaxReport = 20
-)
+# ---------------- paths (edit only if your layout differs) ------------------
+$ROOT = 'C:\NLG'
+if ($env:NLG_ROOT) { $ROOT = $env:NLG_ROOT }        # honoured for testing
+
+$SOURCE   = Join-Path $ROOT 'Source Data\AgentSales\Agentsalesdatasalesforce.csv'
+$PREPARED = Join-Path $ROOT 'Load Result\AgentSalesUpsert_input.csv'
+$ARCHIVE  = Join-Path $ROOT 'Archive'
+$LOGDIR   = Join-Path $ROOT 'Log'
+$REPORT   = Join-Path $LOGDIR 'AgentSales-csv-check.txt'
+$EXTID    = 'ProducerID'                             # column holding the agent id
+$MAXREPORT = 20
 
 $ErrorActionPreference = 'Stop'
-$interactive = -not $Csv
 
-function Clean-Path([string] $p) {
-    if ($null -eq $p) { return '' }
-    return $p.Trim().Trim('"').Trim("'").Trim()
+# ---------------- output helper --------------------------------------------
+$lines = New-Object 'System.Collections.Generic.List[string]'
+function Say([string] $t = '', [string] $colour = '') {
+    $lines.Add($t)
+    if ($colour) { Write-Host $t -ForegroundColor $colour } else { Write-Host $t }
 }
 
-function Stop-Script([int] $code) {
-    if ($interactive) { Write-Host ''; [void](Read-Host 'Press Enter to close') }
-    exit $code
-}
-
-# --- the parser -------------------------------------------------------------
-# Walks the text with the same quoting rules the Bulk API uses, and returns one
-# object per RECORD (not per line) so a record that spans lines is visible.
+# ---------------- the parser ------------------------------------------------
+# Same quoting rules the Bulk API uses. Returns one object per RECORD, so a
+# record spanning physical lines is visible instead of silently miscounted.
 function Read-Records([string] $text) {
-    $recs   = New-Object 'System.Collections.Generic.List[object]'
-    $fields = 1
-    $inQ    = $false
-    $line   = 1
-    $start  = 1
-    $spans  = 0
-    $firstField = New-Object Text.StringBuilder
+    $recs = New-Object 'System.Collections.Generic.List[object]'
+    $fields = 1; $inQ = $false; $line = 1; $start = 1; $spans = 0
+    $first = New-Object Text.StringBuilder
     $capture = $true
-    $i = 0
-    $n = $text.Length
-
+    $i = 0; $n = $text.Length
     while ($i -lt $n) {
         $c = $text[$i]
         if ($inQ) {
             if ($c -eq '"') {
-                if (($i + 1) -lt $n -and $text[$i + 1] -eq '"') { $i++ }   # escaped ""
-                else { $inQ = $false }
+                if (($i + 1) -lt $n -and $text[$i + 1] -eq '"') { $i++ } else { $inQ = $false }
             }
             elseif ($c -eq "`n") { $line++; $spans++ }
         }
         else {
-            switch ($c) {
-                '"'    { $inQ = $true }
-                ','    { $fields++; $capture = $false }
-                "`r"   { }
-                "`n"   {
-                    $recs.Add([pscustomobject]@{
-                        StartLine = $start; Fields = $fields; SpannedLines = $spans
-                        FirstField = $firstField.ToString()
-                    })
-                    $line++; $start = $line; $fields = 1; $spans = 0
-                    $firstField = New-Object Text.StringBuilder
-                    $capture = $true
-                }
-                default { if ($capture) { [void]$firstField.Append($c) } }
+            if     ($c -eq '"')  { $inQ = $true }
+            elseif ($c -eq ',')  { $fields++; $capture = $false }
+            elseif ($c -eq "`r") { }
+            elseif ($c -eq "`n") {
+                $recs.Add([pscustomobject]@{ StartLine=$start; Fields=$fields; Spans=$spans; First=$first.ToString() })
+                $line++; $start = $line; $fields = 1; $spans = 0
+                $first = New-Object Text.StringBuilder; $capture = $true
             }
+            elseif ($capture) { [void]$first.Append($c) }
         }
         $i++
     }
-    # trailing record with no final newline
-    if ($fields -gt 1 -or $firstField.Length -gt 0) {
-        $recs.Add([pscustomobject]@{
-            StartLine = $start; Fields = $fields; SpannedLines = $spans
-            FirstField = $firstField.ToString()
-        })
+    if ($fields -gt 1 -or $first.Length -gt 0) {
+        $recs.Add([pscustomobject]@{ StartLine=$start; Fields=$fields; Spans=$spans; First=$first.ToString() })
     }
-    return @{ Records = $recs; UnterminatedQuote = $inQ }
+    return @{ Records = $recs; Unterminated = $inQ }
 }
 
 function Analyse([string] $path) {
     $bytes = [IO.File]::ReadAllBytes($path)
-    $bom   = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-
-    $crlf = 0; $lf = 0
-    for ($i = 0; $i -lt $bytes.Length; $i++) {
-        if ($bytes[$i] -eq 10) { if ($i -gt 0 -and $bytes[$i-1] -eq 13) { $crlf++ } else { $lf++ } }
-    }
-
-    $ctrl = 0; $ctrlZ = 0; $ctrlAt = @()
+    $bom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    $crlf = 0; $lf = 0; $ctrl = 0; $ctrlZ = 0; $firstCtrl = -1
     for ($i = 0; $i -lt $bytes.Length; $i++) {
         $b = $bytes[$i]
-        if ($b -eq 0x1A) { $ctrlZ++; if ($ctrlAt.Count -lt 5) { $ctrlAt += $i } }
+        if ($b -eq 10) { if ($i -gt 0 -and $bytes[$i-1] -eq 13) { $crlf++ } else { $lf++ } }
+        elseif ($b -eq 0x1A) { $ctrlZ++; if ($firstCtrl -lt 0) { $firstCtrl = $i } }
         elseif (($b -le 0x08) -or ($b -eq 0x0B) -or ($b -eq 0x0C) -or ($b -ge 0x0E -and $b -le 0x1F)) {
-            $ctrl++; if ($ctrlAt.Count -lt 5) { $ctrlAt += $i }
+            $ctrl++; if ($firstCtrl -lt 0) { $firstCtrl = $i }
         }
     }
-
-    # StreamReader consumes the BOM so header names compare cleanly
-    $reader = [IO.StreamReader]::new($path, $true)
-    $text   = $reader.ReadToEnd()
-    $reader.Close()
-
-    $parsed = Read-Records $text
-    $quotes = ($text.ToCharArray() | Where-Object { $_ -eq '"' }).Count
-
+    $reader = [IO.StreamReader]::new($path, $true)   # consumes the BOM
+    $text = $reader.ReadToEnd(); $reader.Close()
+    $p = Read-Records $text
     return [pscustomobject]@{
-        Path = $path; Bytes = $bytes.Length; Bom = $bom
-        Crlf = $crlf; Lf = $lf; Ctrl = $ctrl; CtrlZ = $ctrlZ; CtrlAt = $ctrlAt
-        Quotes = $quotes; Unterminated = $parsed.UnterminatedQuote
-        Records = $parsed.Records
-        Text = $text
+        Path=$path; Bytes=$bytes.Length; Bom=$bom; Crlf=$crlf; Lf=$lf
+        Ctrl=$ctrl; CtrlZ=$ctrlZ; FirstCtrl=$firstCtrl
+        Quotes=($text.ToCharArray() | Where-Object { $_ -eq '"' }).Count
+        Unterminated=$p.Unterminated; Records=$p.Records
+        Header=(($text -split "`r?`n")[0])
     }
 }
 
-# --- input ------------------------------------------------------------------
-Write-Host ''
-Write-Host '  diagnose-BulkCsv.ps1 - why did Bulk API reject this CSV?'
-Write-Host '  --------------------------------------------------------'
-
-if ($interactive) {
-    Write-Host ''
-    $Csv = Clean-Path (Read-Host '  CSV path')
-}
-$Csv = Clean-Path $Csv
-if (-not (Test-Path -LiteralPath $Csv)) { Write-Host "  Not found: $Csv" -ForegroundColor Red; Stop-Script 2 }
-$Csv = (Resolve-Path -LiteralPath $Csv).Path
-
-$a = Analyse $Csv
-if ($a.Records.Count -eq 0) { Write-Host '  File has no records.' -ForegroundColor Red; Stop-Script 2 }
-
-$header   = $a.Records[0]
-$expected = $header.Fields
-$data     = $a.Records | Select-Object -Skip 1
-
-$headerLine = ($a.Text -split "`r?`n")[0]
-$cols = $headerLine -split ','
-
-Write-Host ''
-Write-Host "  file            : $Csv"
-Write-Host "  bytes           : $($a.Bytes)"
-Write-Host "  BOM             : $(if ($a.Bom) { 'yes (harmless - the loader strips it)' } else { 'no' })"
-Write-Host "  line endings    : CRLF $($a.Crlf), bare LF $($a.Lf)$(if ($a.Crlf -gt 0 -and $a.Lf -gt 0) { '   <-- MIXED' })"
-Write-Host "  header fields   : $expected"
-Write-Host "  data records    : $($data.Count)"
-Write-Host "  double quotes   : $($a.Quotes)"
-Write-Host ''
-
-# --- findings ---------------------------------------------------------------
-$problems = @()
-
-if ($a.Unterminated) {
-    $problems += 'UNBALANCED QUOTE'
-    Write-Host '  *** UNBALANCED DOUBLE QUOTE - the file ends inside a quoted field. ***' -ForegroundColor Red
-    Write-Host '      From the opening quote onward every newline is swallowed into one' -ForegroundColor Red
-    Write-Host '      field, so every row boundary after it is wrong. This is the most' -ForegroundColor Red
-    Write-Host '      common cause of "Field name not found : <a data value>".' -ForegroundColor Red
-    Write-Host ''
-}
-
-$bad = @($data | Where-Object { $_.Fields -ne $expected })
-if ($bad.Count -gt 0) {
-    $problems += 'FIELD COUNT'
-    Write-Host "  *** $($bad.Count) record(s) do not have $expected fields. ***" -ForegroundColor Red
-    Write-Host '      Bulk API cannot line these up with the header.' -ForegroundColor Red
-    $bad | Select-Object -First $MaxReport | ForEach-Object {
-        "      line {0,-8} {1,3} fields (expected {2})   first field: {3}" -f $_.StartLine, $_.Fields, $expected, $_.FirstField
+# Reports on one file. Returns the list of problem names found.
+function Report([string] $label, [string] $path) {
+    Say ''
+    Say "=============================================================="
+    Say "  $label"
+    Say "  $path"
+    Say "=============================================================="
+    if (-not (Test-Path -LiteralPath $path)) {
+        Say '  NOT FOUND - skipped.' 'Yellow'
+        return @()
     }
-    if ($bad.Count -gt $MaxReport) { Write-Host "      ... and $($bad.Count - $MaxReport) more" -ForegroundColor Red }
-    Write-Host ''
-}
+    $a = Analyse $path
+    if ($a.Records.Count -eq 0) { Say '  File is empty.' 'Red'; return @('EMPTY') }
 
-$spanning = @($data | Where-Object { $_.SpannedLines -gt 0 })
-if ($spanning.Count -gt 0) {
-    $problems += 'EMBEDDED NEWLINE'
-    Write-Host "  *** $($spanning.Count) record(s) span more than one physical line. ***" -ForegroundColor Yellow
-    Write-Host '      Legal CSV, but it means a value contains a line break - and it makes' -ForegroundColor Yellow
-    Write-Host '      the loader row-count guard disagree with the server.' -ForegroundColor Yellow
-    $spanning | Select-Object -First $MaxReport | ForEach-Object {
-        "      starts line {0,-8} spans {1} extra line(s)   first field: {2}" -f $_.StartLine, $_.SpannedLines, $_.FirstField
+    $expected = $a.Records[0].Fields
+    $data = $a.Records | Select-Object -Skip 1
+
+    Say ("  bytes             : {0:N0}" -f $a.Bytes)
+    Say "  BOM               : $(if ($a.Bom) { 'yes (harmless, the loader strips it)' } else { 'no' })"
+    Say "  line endings      : CRLF $($a.Crlf), bare LF $($a.Lf)$(if ($a.Crlf -gt 0 -and $a.Lf -gt 0) { '   <-- MIXED' })"
+    Say "  header fields     : $expected"
+    Say ("  data RECORDS      : {0:N0}" -f $data.Count)
+    Say "  double quotes     : $($a.Quotes)"
+    Say "  header            : $($a.Header)"
+
+    $problems = @()
+
+    if ($a.Unterminated) {
+        $problems += 'UNBALANCED QUOTE'
+        Say ''
+        Say '  *** UNBALANCED DOUBLE QUOTE - the file ends inside a quoted field. ***' 'Red'
+        Say '      Every newline after the opening quote is swallowed into one field,' 'Red'
+        Say '      so every row boundary past it is wrong. This is the single most' 'Red'
+        Say '      likely cause of "Field name not found : <a data value>".' 'Red'
     }
-    Write-Host ''
-}
 
-if ($a.CtrlZ -gt 0) {
-    $problems += 'CTRL-Z'
-    Write-Host "  *** $($a.CtrlZ) x 0x1A (Ctrl-Z) byte(s), first at offset $($a.CtrlAt[0]). ***" -ForegroundColor Red
-    Write-Host '      This is what truncated a 100,000-row file to 65,535 rows before.' -ForegroundColor Red
-    Write-Host ''
-}
-if ($a.Ctrl -gt 0) {
-    $problems += 'CONTROL CHARS'
-    Write-Host "  *** $($a.Ctrl) other control character(s), first at offset $($a.CtrlAt[0]). ***" -ForegroundColor Red
-    Write-Host ''
-}
-
-if ($ExtIdColumn) {
-    $idx = [Array]::FindIndex($cols, [Predicate[string]] { $args[0].Trim() -ieq $ExtIdColumn.Trim() })
-    if ($idx -lt 0) {
-        Write-Host "  -ExtIdColumn '$ExtIdColumn' is not in the header. Columns:" -ForegroundColor Yellow
-        for ($j = 0; $j -lt $cols.Count; $j++) { Write-Host ("    {0,3}  {1}" -f ($j + 1), $cols[$j]) }
-    }
-    else {
-        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        $dupe = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        $blank = 0
-        Import-Csv -LiteralPath $Csv | ForEach-Object {
-            $v = "$($_.$ExtIdColumn)".Trim()
-            if (-not $v) { $blank++ } elseif (-not $seen.Add($v)) { [void]$dupe.Add($v) }
+    $bad = @($data | Where-Object { $_.Fields -ne $expected })
+    if ($bad.Count -gt 0) {
+        $problems += 'FIELD COUNT'
+        Say ''
+        Say "  *** $($bad.Count) record(s) do not have $expected fields. ***" 'Red'
+        Say '      Bulk API cannot line these up with the header.' 'Red'
+        $bad | Select-Object -First $MAXREPORT | ForEach-Object {
+            Say ("      line {0,-8} {1,3} fields (expected {2})   starts: {3}" -f $_.StartLine, $_.Fields, $expected, $_.First)
         }
-        Write-Host "  external id '$ExtIdColumn': $($seen.Count) distinct, $($dupe.Count) duplicated, $blank blank"
-        if ($dupe.Count -gt 0) {
-            Write-Host '      On upsert the LAST row for a duplicated key silently wins.' -ForegroundColor Yellow
-            $dupe | Select-Object -First 10 | ForEach-Object { "      $_" }
+        if ($bad.Count -gt $MAXREPORT) { Say "      ... and $($bad.Count - $MAXREPORT) more" 'Red' }
+    }
+
+    $span = @($data | Where-Object { $_.Spans -gt 0 })
+    if ($span.Count -gt 0) {
+        $problems += 'EMBEDDED NEWLINE'
+        Say ''
+        Say "  *** $($span.Count) record(s) span more than one physical line. ***" 'Yellow'
+        Say '      A value contains a line break. Legal CSV, but it makes the' 'Yellow'
+        Say '      loader row-count guard disagree with the server.' 'Yellow'
+        $span | Select-Object -First $MAXREPORT | ForEach-Object {
+            Say ("      starts line {0,-8} spans {1} extra line(s)   starts: {2}" -f $_.StartLine, $_.Spans, $_.First)
         }
-        Write-Host ''
+    }
+
+    if ($a.CtrlZ -gt 0) {
+        $problems += 'CTRL-Z'
+        Say ''
+        Say "  *** $($a.CtrlZ) x 0x1A (Ctrl-Z) byte(s), first at offset $($a.FirstCtrl). ***" 'Red'
+        Say '      This is what truncated a 100,000-row file to 65,535 rows before.' 'Red'
+    }
+    if ($a.Ctrl -gt 0) {
+        $problems += 'CONTROL CHARS'
+        Say ''
+        Say "  *** $($a.Ctrl) other control character(s), first at offset $($a.FirstCtrl). ***" 'Red'
+    }
+
+    # duplicates in the upsert key
+    $cols = $a.Header -split ','
+    $idx = [Array]::FindIndex($cols, [Predicate[string]] { $args[0].Trim() -ieq $EXTID })
+    if ($idx -ge 0 -and $problems.Count -eq 0) {
+        try {
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $dupe = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $blank = 0
+            Import-Csv -LiteralPath $path | ForEach-Object {
+                $v = "$($_.$EXTID)".Trim()
+                if (-not $v) { $blank++ } elseif (-not $seen.Add($v)) { [void]$dupe.Add($v) }
+            }
+            Say ''
+            Say "  '$EXTID' : $($seen.Count) distinct, $($dupe.Count) duplicated, $blank blank"
+            if ($dupe.Count -gt 0) {
+                Say '      On upsert the LAST row for a duplicated key silently wins.' 'Yellow'
+                $dupe | Select-Object -First 10 | ForEach-Object { Say "      $_" }
+            }
+        } catch { Say "  (duplicate check skipped: $($_.Exception.Message))" 'Yellow' }
+    }
+
+    if ($problems.Count -eq 0) { Say ''; Say '  No structural defect in this file.' 'Green' }
+    return $problems
+}
+
+# ---------------- run -------------------------------------------------------
+Clear-Host
+Say ''
+Say '  check-AgentSales.ps1 - why did AgentSalesUpsert fail?'
+Say "  run at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')   root: $ROOT"
+
+$pSource   = Report 'FILE 1 of 3 - the source CSV you are loading now' $SOURCE
+$pPrepared = Report 'FILE 2 of 3 - what the loader actually SENT to Salesforce' $PREPARED
+
+# newest archived copy of the same filename = the run that succeeded
+$arch = $null
+if (Test-Path -LiteralPath $ARCHIVE) {
+    $arch = Get-ChildItem -LiteralPath $ARCHIVE -Recurse -Filter 'Agentsalesdatasalesforce.csv' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+$pArch = @()
+if ($arch) { $pArch = Report 'FILE 3 of 3 - the archived copy from the run that WORKED' $arch.FullName }
+else {
+    Say ''
+    Say '=============================================================='
+    Say '  FILE 3 of 3 - archived copy'
+    Say '=============================================================='
+    Say "  No Agentsalesdatasalesforce.csv found anywhere under $ARCHIVE." 'Yellow'
+    Say '  The bat archives the source only when a job SUCCEEDS, so if there is' 'Yellow'
+    Say '  no copy here then AgentSalesUpsert has never completed. In that case' 'Yellow'
+    Say '  this is not a regression - the file was always malformed and we are' 'Yellow'
+    Say '  catching it for the first time.' 'Yellow'
+}
+
+# ---------------- side by side ---------------------------------------------
+if ($arch -and (Test-Path -LiteralPath $SOURCE)) {
+    $a = Analyse $SOURCE
+    $b = Analyse $arch.FullName
+    Say ''
+    Say '=============================================================='
+    Say '  NOW vs THE RUN THAT WORKED'
+    Say '=============================================================='
+    Say ("  {0,-20} {1,18} {2,18}" -f '', 'LOADING NOW', 'WORKED BEFORE')
+    Say ("  {0,-20} {1,18:N0} {2,18:N0}" -f 'bytes',         $a.Bytes, $b.Bytes)
+    Say ("  {0,-20} {1,18:N0} {2,18:N0}" -f 'data records',  ($a.Records.Count - 1), ($b.Records.Count - 1))
+    Say ("  {0,-20} {1,18} {2,18}"       -f 'header fields', $a.Records[0].Fields, $b.Records[0].Fields)
+    Say ("  {0,-20} {1,18} {2,18}"       -f 'double quotes', $a.Quotes, $b.Quotes)
+    Say ("  {0,-20} {1,18} {2,18}"       -f 'bare LF',       $a.Lf, $b.Lf)
+    Say ("  {0,-20} {1,18} {2,18}"       -f 'control chars', ($a.Ctrl + $a.CtrlZ), ($b.Ctrl + $b.CtrlZ))
+    Say ''
+    if ($a.Header -ne $b.Header) {
+        Say '  *** THE HEADERS DIFFER. ***' 'Red'
+        Say "      now    : $($a.Header)" 'Red'
+        Say "      before : $($b.Header)" 'Red'
+    } else { Say '  Headers are identical.' 'Green' }
+    if ($a.Bytes -ne $b.Bytes) {
+        Say ''
+        Say '  Byte sizes differ - these are NOT the same file. That is what changed' 'Yellow'
+        Say '  between the run that worked and this one.' 'Yellow'
     }
 }
 
-# --- compare against a known-good copy --------------------------------------
-if ($Against) {
-    $Against = Clean-Path $Against
-    if (-not (Test-Path -LiteralPath $Against)) {
-        Write-Host "  -Against not found: $Against" -ForegroundColor Yellow
-    }
-    else {
-        $b = Analyse ((Resolve-Path -LiteralPath $Against).Path)
-        $bHeader = ($b.Text -split "`r?`n")[0]
-        Write-Host '  ---- compared with the known-good copy ----'
-        "  {0,-18} {1,20} {2,20}" -f '', 'THIS FILE', 'KNOWN GOOD'
-        "  {0,-18} {1,20} {2,20}" -f 'bytes',        $a.Bytes,          $b.Bytes
-        "  {0,-18} {1,20} {2,20}" -f 'data records', $data.Count,       ($b.Records.Count - 1)
-        "  {0,-18} {1,20} {2,20}" -f 'header fields',$expected,         $b.Records[0].Fields
-        "  {0,-18} {1,20} {2,20}" -f 'double quotes',$a.Quotes,         $b.Quotes
-        "  {0,-18} {1,20} {2,20}" -f 'bare LF',      $a.Lf,             $b.Lf
-        "  {0,-18} {1,20} {2,20}" -f 'control chars',($a.Ctrl+$a.CtrlZ),($b.Ctrl+$b.CtrlZ)
-        Write-Host ''
-        if ($headerLine -ne $bHeader) {
-            Write-Host '  *** THE HEADERS DIFFER. ***' -ForegroundColor Red
-            Write-Host "      this file : $headerLine" -ForegroundColor Red
-            Write-Host "      known good: $bHeader" -ForegroundColor Red
-        }
-        else { Write-Host '  headers are identical.' -ForegroundColor Green }
-        Write-Host ''
-    }
+# ---------------- verdict ---------------------------------------------------
+Say ''
+Say '=============================================================='
+Say '  VERDICT'
+Say '=============================================================='
+if ($pSource.Count -gt 0) {
+    Say "  The SOURCE CSV is malformed: $($pSource -join ', ')" 'Red'
+    Say ''
+    Say '  That is the root cause. The server reported a data value as a field' 'Red'
+    Say '  name because the parser lost the row boundaries at the record(s)' 'Red'
+    Say '  listed under FILE 1 above.' 'Red'
+    Say ''
+    Say '  FIX: repair those record(s) in the source CSV, then:' 'Cyan'
+    Say '       run-AgencyAgentLoad.bat AgentSalesUpsert' 'Cyan'
+    Say ''
+    Say '  If an archived copy exists and is clean, the fastest fix is to put it' 'Cyan'
+    Say '  back and re-export whatever changed since.' 'Cyan'
+    Say ''
+    Say '  Do NOT repair it by opening in Excel and saving - an Excel round-trip' 'Yellow'
+    Say '  re-quotes fields and reformats numbers, and is a common way this' 'Yellow'
+    Say '  damage is introduced.' 'Yellow'
 }
-
-# --- verdict ----------------------------------------------------------------
-Write-Host '  ================ VERDICT ================'
-if ($problems.Count -eq 0) {
-    Write-Host '  No structural defect found. Records all have the same field count,' -ForegroundColor Green
-    Write-Host '  quotes are balanced, no control characters.' -ForegroundColor Green
-    Write-Host ''
-    Write-Host '  If Bulk API still rejects it, the problem is NOT csv structure:' -ForegroundColor Cyan
-    Write-Host '    - a column name in the header is not a real field on the object' -ForegroundColor Cyan
-    Write-Host '      (check the SDL right-hand side against sf sobject describe), or' -ForegroundColor Cyan
-    Write-Host '    - the SDL was not applied, so raw legacy headers went out. The log' -ForegroundColor Cyan
-    Write-Host '      line "SDL mappings: 0" is the tell; it should equal the column count.' -ForegroundColor Cyan
+elseif ($pPrepared.Count -gt 0) {
+    Say "  The source CSV is clean, but the PREPARED file is malformed: $($pPrepared -join ', ')" 'Red'
+    Say ''
+    Say '  So the defect is introduced by the loader prepare step, not by the' 'Red'
+    Say '  extract. That points at the header rewrite / body copy in the bat.' 'Red'
+    Say '  Send this report - the fix belongs in the script, not the data.' 'Red'
 }
 else {
-    Write-Host "  Structural defect(s): $($problems -join ', ')" -ForegroundColor Red
-    Write-Host ''
-    Write-Host '  This is why the server reported a DATA VALUE as a field name: the' -ForegroundColor Red
-    Write-Host '  parser lost the row boundaries and read a value where it expected a' -ForegroundColor Red
-    Write-Host '  column. Fix the record(s) listed above and reload.' -ForegroundColor Red
-    Write-Host ''
-    Write-Host '  Do NOT fix it by opening the file in Excel and saving - an Excel' -ForegroundColor Yellow
-    Write-Host '  round-trip re-quotes fields and reformats numbers, which is a common' -ForegroundColor Yellow
-    Write-Host '  way this kind of damage gets introduced in the first place.' -ForegroundColor Yellow
+    Say '  No structural defect found in either file.' 'Green'
+    Say ''
+    Say '  So it is NOT csv structure. Two possibilities remain:' 'Cyan'
+    Say '    1. a column name in the prepared header is not a real field on' 'Cyan'
+    Say '       Contact - check every right-hand value in AgentSalesMapping.sdl' 'Cyan'
+    Say '       against:  sf sobject describe -s Contact -o dev3cc' 'Cyan'
+    Say '       Annualized_Premium_MTD__c was already flagged as UNVERIFIED.' 'Cyan'
+    Say '    2. the SDL was not applied - but your log says "SDL mappings: 10",' 'Cyan'
+    Say '       so this one is already ruled out.' 'Cyan'
+    Say ''
+    Say '  Possibility 1 is the likely answer. Bulk API reports only the FIRST' 'Cyan'
+    Say '  bad field name per run, so check all ten at once.' 'Cyan'
+}
+
+# ---------------- save ------------------------------------------------------
+Say ''
+try {
+    if (-not (Test-Path -LiteralPath $LOGDIR)) { New-Item -ItemType Directory -Path $LOGDIR -Force | Out-Null }
+    [IO.File]::WriteAllLines($REPORT, $lines, [Text.UTF8Encoding]::new($false))
+    Write-Host "  Report saved: $REPORT" -ForegroundColor Green
+    Write-Host '  Open it and paste the contents back for the fix.' -ForegroundColor Green
+} catch {
+    Write-Host "  Could not save the report: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 Write-Host ''
-Stop-Script $(if ($problems.Count -eq 0) { 0 } else { 1 })
+[void](Read-Host 'Press Enter to close')
