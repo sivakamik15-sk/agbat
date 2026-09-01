@@ -1,0 +1,351 @@
+<#
+    rebuild-MasterId.ps1 - rebuild column A (Master_ID__c) from column B
+    (the agent id) and column C (the product name).
+
+    Run it with no arguments. It asks for the CSV path, shows you a preview of
+    what will change, and then asks whether to update the file in place (a .bak
+    backup is taken) or write a new file beside it.
+
+    THE RULE
+
+        Master_ID__c = <agent id padded left with '0' to 15 chars>
+                       + ' ' + Product_Name__c
+
+        277033 + LSW TERM 20   ->   000000000277033 LSW TERM 20
+        411733 + FLEXLIFE II   ->   000000000411733 FLEXLIFE II
+
+    WHY YOU NEED THIS
+    In the extract, column A's number is NOT column B's agent id - e.g. A reads
+    000000000002780 while B reads 277033. So Master_ID__c currently encodes some
+    other id, and since Master_ID__c is the UPSERT KEY, loading it as-is would
+    upsert onto the wrong record - or insert rows keyed on a meaningless id.
+    Rebuilding it from B and C makes the key agree with the row it sits on.
+
+    HOW THIS DIFFERS FROM fill-MasterId.ps1
+    That one FILLS BLANKS and refuses to touch populated values unless you pass
+    -Force. This one always REBUILDS, which is the whole point - so it is the
+    right tool when column A already has the wrong values in it.
+
+    THE PAD WIDTH IS READ FROM YOUR DATA, NOT ASSUMED
+    15 is the default, but if column A already holds values the script measures
+    the position of the separator in them and reports what it found. If the file
+    disagrees with 15 it tells you and uses the file's number, because the file
+    is the authority - not this script.
+
+    COLUMN B IS FOUND BY NAME, WHICH VARIES BETWEEN OBJECTS
+    AnnuityProductMix uses Contact_ID__r.Master_Agent_ID__c and the LSW
+    hierarchy objects use Contact__r.Master_Agent_ID__c. Rather than make you
+    remember which, it matches any header ending in Master_Agent_ID__c. Override
+    with -IdColumn if a file has more than one.
+
+    DUPLICATES ARE CHECKED, because Master_ID__c is an upsert key
+    Two rows with the same agent AND the same product produce the same
+    Master_ID__c. On an insert that is DUPLICATE_VALUE; on an upsert the later
+    row silently overwrites the earlier one and you lose a row with no error.
+    Reported before anything is written.
+
+    USAGE
+      .\rebuild-MasterId.ps1                       asks for the path
+      .\rebuild-MasterId.ps1 -Csv 'C:\x\AGENCY1000.csv'
+      .\rebuild-MasterId.ps1 -Csv x.csv -InPlace          overwrite, .bak kept
+      .\rebuild-MasterId.ps1 -Csv x.csv -Out y.csv
+      .\rebuild-MasterId.ps1 -Csv x.csv -Width 15 -IdColumn 'Contact__r.Master_Agent_ID__c'
+
+    Only column A is rewritten. Every other field is written back exactly as it
+    was read. Output is UTF-8 with NO BOM and CRLF endings.
+#>
+
+[CmdletBinding()]
+param(
+    [string] $Csv,
+    [string] $Out,
+    [switch] $InPlace,
+    [string] $TargetColumn = 'Master_ID__c',
+    [string] $IdColumn,
+    [string] $NameColumn   = 'Product_Name__c',
+    [int]    $Width        = 15,
+    [string] $Separator    = ' ',
+    [switch] $Force
+)
+
+$ErrorActionPreference = 'Stop'
+$interactive = -not $Csv
+
+function Stop-Script([int] $code) {
+    if ($interactive) { Write-Host ''; [void](Read-Host 'Press Enter to close') }
+    exit $code
+}
+function Clean-Path([string] $p) {
+    if ($null -eq $p) { return '' }
+    return $p.Trim().Trim('"').Trim("'").Trim()
+}
+
+Write-Host ''
+Write-Host '  rebuild-MasterId.ps1 - column A = padded column B + space + column C'
+Write-Host '  --------------------------------------------------------------------'
+
+# --- the file ---------------------------------------------------------------
+if ($interactive) {
+    $tries = 0
+    while ($true) {
+        Write-Host ''
+        $Csv = Clean-Path (Read-Host '  Source CSV path')
+        if (-not $Csv) {
+            $tries++
+            if ($tries -ge 3) { Write-Host '  No input. Aborting.' -ForegroundColor Red; Stop-Script 2 }
+            Write-Host '  Nothing entered - paste the path.' -ForegroundColor Yellow
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $Csv)) { Write-Host "  Not found: $Csv" -ForegroundColor Red; continue }
+        if ((Get-Item -LiteralPath $Csv).PSIsContainer) { Write-Host '  That is a folder.' -ForegroundColor Red; continue }
+        break
+    }
+}
+$Csv = Clean-Path $Csv
+if (-not (Test-Path -LiteralPath $Csv)) { Write-Host "  Not found: $Csv" -ForegroundColor Red; Stop-Script 2 }
+$Csv = (Resolve-Path -LiteralPath $Csv).Path
+
+# StreamReader with BOM detection consumes a UTF-8 BOM, so header names compare
+# cleanly instead of carrying three invisible bytes on the first one.
+$reader = [IO.StreamReader]::new($Csv, $true)
+$header = $reader.ReadLine()
+if ($null -eq $header) { $reader.Close(); Write-Host '  File is empty.' -ForegroundColor Red; Stop-Script 2 }
+$cols = $header -split ','
+
+function Show-Columns {
+    Write-Host '  Columns present:' -ForegroundColor Yellow
+    for ($j = 0; $j -lt $cols.Count; $j++) { Write-Host ("    {0,3}  {1}" -f ($j + 1), $cols[$j]) -ForegroundColor Yellow }
+}
+function Find-Exact([string] $name) {
+    return [Array]::FindIndex($cols, [Predicate[string]] { $args[0].Trim() -ieq $name.Trim() })
+}
+
+$tgtIdx  = Find-Exact $TargetColumn
+$nameIdx = Find-Exact $NameColumn
+foreach ($pair in @(@{n=$TargetColumn;i=$tgtIdx}, @{n=$NameColumn;i=$nameIdx})) {
+    if ($pair.i -lt 0) {
+        $reader.Close(); Write-Host ''
+        Write-Host "  Column '$($pair.n)' is not in the header." -ForegroundColor Red
+        Show-Columns; Stop-Script 2
+    }
+}
+
+# --- locate column B -------------------------------------------------------
+# The relationship name differs per object (Contact_ID__r vs Contact__r), so
+# match on the part that does not change.
+if ($IdColumn) {
+    $idIdx = Find-Exact $IdColumn
+    if ($idIdx -lt 0) { $reader.Close(); Write-Host "  -IdColumn '$IdColumn' not in the header." -ForegroundColor Red; Show-Columns; Stop-Script 2 }
+}
+else {
+    $idIdx = -1
+    foreach ($cand in @('Contact_ID__r.Master_Agent_ID__c','Contact__r.Master_Agent_ID__c')) {
+        $idIdx = Find-Exact $cand
+        if ($idIdx -ge 0) { break }
+    }
+    if ($idIdx -lt 0) {
+        $hits = @()
+        for ($j = 0; $j -lt $cols.Count; $j++) { if ($cols[$j].Trim() -match 'Master_Agent_ID__c$') { $hits += $j } }
+        if ($hits.Count -eq 1) { $idIdx = $hits[0] }
+        elseif ($hits.Count -gt 1) {
+            $reader.Close(); Write-Host ''
+            Write-Host '  More than one column ends in Master_Agent_ID__c - say which with -IdColumn:' -ForegroundColor Red
+            $hits | ForEach-Object { Write-Host "      $($cols[$_].Trim())" -ForegroundColor Red }
+            Stop-Script 2
+        }
+    }
+    if ($idIdx -lt 0) {
+        $reader.Close(); Write-Host ''
+        Write-Host '  Could not find an agent id column (nothing ends in Master_Agent_ID__c).' -ForegroundColor Red
+        Write-Host '  Pass it explicitly with -IdColumn.' -ForegroundColor Red
+        Show-Columns; Stop-Script 2
+    }
+}
+
+Write-Host ''
+Write-Host "  file        : $Csv"
+Write-Host "  A  target   : $($cols[$tgtIdx].Trim())        (field $($tgtIdx + 1))"
+Write-Host "  B  agent id : $($cols[$idIdx].Trim())   (field $($idIdx + 1))"
+Write-Host "  C  name     : $($cols[$nameIdx].Trim())     (field $($nameIdx + 1))"
+
+# --- read everything -------------------------------------------------------
+$rows = New-Object 'System.Collections.Generic.List[string[]]'
+$srcRows = 0; $ctrl = 0; $ragged = 0; $widths = @{}
+try {
+    while ($null -ne ($line = $reader.ReadLine())) {
+        if ($line.Trim() -eq '') { continue }
+        if ($line.Contains('"')) {
+            $reader.Close(); Write-Host ''
+            Write-Host "  Row $($srcRows + 1) contains a double quote." -ForegroundColor Red
+            Write-Host '  Column A cannot be replaced without splitting the row, and a quoted' -ForegroundColor Red
+            Write-Host '  field could hide a comma that would shift every column after it.' -ForegroundColor Red
+            Write-Host '  Re-export without quoting, or pre-trim the CSV.' -ForegroundColor Red
+            Stop-Script 2
+        }
+        $clean = $line -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', ''
+        if ($clean -ne $line) { $ctrl++ }
+        $f = $clean -split ','
+        if ($f.Count -ne $cols.Count) { $ragged++; while ($f.Count -lt $cols.Count) { $f += '' } }
+        $srcRows++
+        $rows.Add($f)
+        $existing = $f[$tgtIdx].Trim()
+        if ($existing) {
+            $sp = $existing.IndexOf($Separator)
+            if ($sp -ge 1) { $widths[$sp] = 1 + [int]$widths[$sp] }
+        }
+    }
+}
+finally { $reader.Close() }
+
+Write-Host "  data rows   : $srcRows"
+
+# --- pad width -------------------------------------------------------------
+if ($widths.Count -gt 0) {
+    $inferred = ($widths.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+    Write-Host ''
+    Write-Host "  pad width read from column A : $inferred"
+    if ($widths.Count -gt 1) { Write-Host "  (more than one width present: $(($widths.Keys | Sort-Object) -join ', '))" -ForegroundColor Yellow }
+    if ($inferred -ne $Width) {
+        Write-Host "  This disagrees with the default $Width. Using $inferred - the file is the authority." -ForegroundColor Yellow
+        $Width = $inferred
+    }
+    else { Write-Host '  matches the expected 15.' -ForegroundColor Green }
+}
+else {
+    Write-Host ''
+    Write-Host "  No value in column A has the '<id>$Separator<name>' shape, so the width" -ForegroundColor Yellow
+    Write-Host "  cannot be measured from this file. Using $Width." -ForegroundColor Yellow
+}
+Write-Host ''
+Write-Host "  rule        : B.PadLeft($Width,'0') + '$Separator' + C"
+
+# --- build -----------------------------------------------------------------
+$built = 0; $skipped = 0; $tooLong = 0; $unchanged = 0
+$seen  = [Collections.Generic.Dictionary[string,int]]::new([StringComparer]::OrdinalIgnoreCase)
+$dupes = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$preview = New-Object 'System.Collections.Generic.List[object]'
+
+foreach ($f in $rows) {
+    $old  = $f[$tgtIdx].Trim()
+    $id   = $f[$idIdx].Trim()
+    $name = $f[$nameIdx].Trim()
+
+    if (-not $id -or -not $name) { $skipped++; continue }        # nothing to build from
+    if ($id.Length -gt $Width) { $tooLong++; $skipped++; continue }  # padding cannot shorten
+
+    $new = $id.PadLeft($Width, '0') + $Separator + $name
+    if ($new -eq $old) { $unchanged++ } else { $built++ }
+    $f[$tgtIdx] = $new
+
+    if ($preview.Count -lt 8) { $preview.Add([pscustomobject]@{ Old = $old; New = $new }) }
+    if ($seen.ContainsKey($new)) { $seen[$new]++; [void]$dupes.Add($new) } else { $seen[$new] = 1 }
+}
+
+Write-Host ''
+Write-Host '  ---- preview ----'
+$preview | ForEach-Object { "    {0,-40} ->  {1}" -f $_.Old, $_.New }
+Write-Host ''
+Write-Host "  rebuilt       : $built"
+if ($unchanged -gt 0) { Write-Host "  already correct: $unchanged" }
+Write-Host "  left untouched : $skipped$(if ($skipped) { '   (blank agent id or product name)' })"
+if ($tooLong -gt 0) { Write-Host "    id longer than $Width chars : $tooLong" -ForegroundColor Red }
+Write-Host "  ctrl chars    : $ctrl"
+Write-Host "  ragged rows   : $ragged"
+
+# --- problems, before writing ---------------------------------------------
+$problem = $false
+if ($tooLong -gt 0) {
+    Write-Host ''
+    Write-Host "  *** $tooLong row(s) have an agent id longer than the $Width-char width. ***" -ForegroundColor Red
+    Write-Host '      Left as they were rather than truncated - truncating would point at' -ForegroundColor Red
+    Write-Host '      a different agent. Check -Width.' -ForegroundColor Red
+    $problem = $true
+}
+if ($dupes.Count -gt 0) {
+    $side = [IO.Path]::ChangeExtension($Csv, $null) + 'duplicate-master-ids.txt'
+    try { [IO.File]::WriteAllLines($side, (@($dupes) | Sort-Object), [Text.UTF8Encoding]::new($false)) } catch { $side = '(sidecar not written)' }
+    Write-Host ''
+    Write-Host "  *** $($dupes.Count) duplicate Master_ID__c value(s) produced. ***" -ForegroundColor Red
+    Write-Host '      Same agent + same product on more than one row. Master_ID__c is the' -ForegroundColor Red
+    Write-Host '      UPSERT KEY, so on load the later row silently overwrites the earlier' -ForegroundColor Red
+    Write-Host '      one and you lose a row with no error reported.' -ForegroundColor Red
+    Write-Host "      Listed in: $side" -ForegroundColor Red
+    $problem = $true
+}
+if ($problem) {
+    if (-not $interactive -and -not $Force) { Stop-Script 1 }
+    if ($interactive) {
+        Write-Host ''
+        $go = Clean-Path (Read-Host '  Continue anyway? (y/N)')
+        if ($go -notmatch '^(y|yes)$') { Write-Host '  Nothing written.' -ForegroundColor Cyan; Stop-Script 1 }
+    }
+}
+if ($built -eq 0 -and $unchanged -eq 0) {
+    Write-Host ''
+    Write-Host '  Nothing could be built - check the three column names above.' -ForegroundColor Red
+    Stop-Script 1
+}
+
+# --- where to write -------------------------------------------------------
+$backup = $null
+if (-not $Out) {
+    if ($InPlace) { $Out = $Csv }
+    elseif ($interactive) {
+        Write-Host ''
+        Write-Host '  Update the original file in place? A .bak backup is kept.'
+        $ans = Clean-Path (Read-Host '  (Y = in place / N = write a new file beside it)')
+        if ($ans -match '^(n|no)$') {
+            $Out = [IO.Path]::ChangeExtension($Csv, $null) + 'masterid.csv'
+        }
+        else { $Out = $Csv }
+    }
+    else { $Out = [IO.Path]::ChangeExtension($Csv, $null) + 'masterid.csv' }
+}
+$Out = Clean-Path $Out
+
+if ($Out -eq $Csv) {
+    $backup = $Csv + '.bak'
+    $n = 1
+    while (Test-Path -LiteralPath $backup) { $backup = "$Csv.bak$n"; $n++ }
+    Copy-Item -LiteralPath $Csv -Destination $backup -Force
+    Write-Host ''
+    Write-Host "  backup      : $backup" -ForegroundColor Green
+}
+elseif ((Test-Path -LiteralPath $Out) -and -not $Force) {
+    $ow = if ($interactive) { Clean-Path (Read-Host "  $Out exists. Overwrite? (y/N)") } else { 'y' }
+    if ($ow -notmatch '^(y|yes)$') { Write-Host '  Nothing written.' -ForegroundColor Cyan; Stop-Script 1 }
+}
+
+# --- write ---------------------------------------------------------------
+$tmp = $Out + '.tmp'
+$writer = [IO.StreamWriter]::new($tmp, $false, [Text.UTF8Encoding]::new($false))
+$writer.NewLine = "`r`n"
+try {
+    $writer.WriteLine($header)
+    foreach ($f in $rows) { $writer.WriteLine(($f -join ',')) }
+}
+finally { $writer.Close() }
+
+$tmpLines = [IO.File]::ReadAllLines($tmp).Count
+if ($tmpLines -ne $srcRows + 1) {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    Write-Host ''
+    Write-Host "  *** LINE COUNT MISMATCH ($tmpLines vs $($srcRows + 1)) - nothing written. ***" -ForegroundColor Red
+    if ($backup) { Write-Host "      The original is untouched; $backup is an identical copy." -ForegroundColor Red }
+    Stop-Script 1
+}
+Move-Item -LiteralPath $tmp -Destination $Out -Force
+
+Write-Host ''
+Write-Host "  written     : $Out"
+Write-Host "  lines       : $tmpLines  ($srcRows data rows + 1 header)"
+if ($ragged -gt 0) {
+    Write-Host "  WARNING: $ragged row(s) had a different column count than the header;" -ForegroundColor Yellow
+    Write-Host '           missing fields were written empty. Check the source extract.' -ForegroundColor Yellow
+}
+Write-Host ''
+Write-Host '  OK - column A rebuilt.' -ForegroundColor Green
+Write-Host '  Next: check the agent ids exist before loading -' -ForegroundColor Cyan
+Write-Host "        prep-AnnuityProductMix.ps1 -In `"$Out`" -DevIds dev3-agent-ids.csv ``" -ForegroundColor Cyan
+Write-Host "           -FkColumn '$($cols[$idIdx].Trim())'" -ForegroundColor Cyan
+Stop-Script 0
