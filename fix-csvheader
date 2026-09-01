@@ -1,0 +1,298 @@
+<#
+    fix-CsvHeader.ps1 - rewrite a CSV header from Salesforce API names to the
+    legacy column names an .sdl expects.
+
+    Run it with no arguments. It asks for the CSV path, then the SDL path, shows
+    you exactly what it will change, and writes the result NEXT TO THIS SCRIPT.
+
+    WHY THIS EXISTS
+    An extract taken with sf data query / Salesforce Inspector comes out with
+    API names as its headers:
+
+        Name__c,ProducerID__c,Status__c
+
+    but the loader maps the OTHER way round. An .sdl line reads
+
+        name=Name__c
+        ^^^^ CSV column header      ^^^^^^^ API name written into the prepared CSV
+
+    so the script looks for a column called "name", finds "Name__c" instead,
+    matches nothing, and either drops every column ("No CSV column matched the
+    SDL") or falls onto the ~6 rows/sec rebuild path. Doing that swap by hand,
+    column by column, is slow and easy to get wrong on a wide file.
+
+    This does it in one pass: for each header it finds the SDL line whose RIGHT
+    side matches, and replaces the header with that line's LEFT side.
+
+        header  Name__c   ->   sdl  name=Name__c   ->   header becomes  name
+
+    WHAT IT WILL NOT DO
+      - It never modifies the input CSV. The result is a new file.
+      - It only rewrites the HEADER LINE. Every data row is copied through
+        byte for byte, so no value can be reformatted, requoted or shifted.
+      - It refuses to write over its own input.
+
+    AMBIGUOUS SDLs ARE REJECTED
+    If two SDL lines share the same right-hand side - say  a=X__c  and  b=X__c -
+    then a header of X__c could legitimately become either "a" or "b" and there
+    is no way to know which. It stops rather than guess.
+
+    ONE ALTERNATIVE WORTH KNOWING
+    If a file's headers are ALREADY api names, you can skip this step entirely
+    by giving that job an IDENTITY sdl (Name__c=Name__c on every line), which is
+    what AnnuityProductMixMapping.sdl does. That keeps the job on the fast path
+    and still acts as a column whitelist. Use this script when you want to keep
+    an existing legacy .sdl as-is.
+
+    USAGE
+      .\fix-CsvHeader.ps1                       asks for both paths
+
+      .\fix-CsvHeader.ps1 -Csv 'C:\x\Agent.csv' -Sdl 'C:\NLG\Config\AgentMapping.sdl'
+      .\fix-CsvHeader.ps1 -Csv x.csv -Sdl y.sdl -Force      skip the confirmation
+      .\fix-CsvHeader.ps1 -Csv x.csv -Sdl y.sdl -OutDir 'C:\NLG\Source Data\Agent'
+
+    Writes UTF-8 with NO BOM and CRLF endings.
+#>
+
+[CmdletBinding()]
+param(
+    [string] $Csv,
+    [string] $Sdl,
+    [string] $OutDir,
+    [switch] $Force
+)
+
+$ErrorActionPreference = 'Stop'
+$interactive = -not ($Csv -and $Sdl)
+
+function Stop-Script([int] $code) {
+    if ($interactive) { Write-Host ''; [void](Read-Host 'Press Enter to close') }
+    exit $code
+}
+
+# Explorer's "Copy as path" wraps the path in quotes and people paste it as-is.
+function Clean-Path([string] $p) {
+    if ($null -eq $p) { return '' }
+    return $p.Trim().Trim('"').Trim("'").Trim()
+}
+
+function Ask-File([string] $message) {
+    $empty = 0
+    while ($true) {
+        Write-Host ''
+        $ans = Clean-Path (Read-Host $message)
+        if (-not $ans) {
+            $empty++
+            if ($empty -ge 3) { Write-Host '  No input. Aborting.' -ForegroundColor Red; Stop-Script 2 }
+            Write-Host '  Nothing entered - paste the path, or press Enter twice more to quit.' -ForegroundColor Yellow
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $ans)) { Write-Host "  Not found: $ans" -ForegroundColor Red; continue }
+        if ((Get-Item -LiteralPath $ans).PSIsContainer) { Write-Host '  That is a folder, not a file.' -ForegroundColor Red; continue }
+        return (Resolve-Path -LiteralPath $ans).Path
+    }
+}
+
+Write-Host ''
+Write-Host '  fix-CsvHeader.ps1 - API names in the header -> the .sdl legacy names'
+Write-Host '  -------------------------------------------------------------------'
+
+# --- inputs -----------------------------------------------------------------
+if ($interactive) {
+    $Csv = Ask-File '  1) CSV file path (headers are API names)'
+    $Sdl = Ask-File '  2) SDL file path (e.g. C:\NLG\Config\AgentMapping.sdl)'
+}
+else {
+    $Csv = Clean-Path $Csv; $Sdl = Clean-Path $Sdl
+    foreach ($p in @($Csv, $Sdl)) {
+        if (-not (Test-Path -LiteralPath $p)) { Write-Host "  Not found: $p" -ForegroundColor Red; Stop-Script 2 }
+    }
+    $Csv = (Resolve-Path -LiteralPath $Csv).Path
+    $Sdl = (Resolve-Path -LiteralPath $Sdl).Path
+}
+
+# --- where the output goes --------------------------------------------------
+# Default: next to THIS script. $PSScriptRoot is empty if the body was pasted
+# into a console rather than run as a file, so fall back to the current folder.
+if (-not $OutDir) {
+    $OutDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+}
+$OutDir = Clean-Path $OutDir
+if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+$OutDir = (Resolve-Path -LiteralPath $OutDir).Path
+
+$leaf = Split-Path -Leaf $Csv
+$Out  = Join-Path $OutDir $leaf
+# Never clobber the source: if the script sits in the same folder as the input,
+# the output would BE the input, which would destroy the only copy of the
+# original header - and the header is the only thing we can map from.
+if ($Out -eq $Csv) {
+    $Out = Join-Path $OutDir (($leaf -replace '\.[^.]*$','') + '-mapped.csv')
+}
+
+# --- read the SDL -----------------------------------------------------------
+# Format is a Java properties file: legacy=ApiName, one per line, # comments.
+# We need it BACKWARDS - api name -> legacy - so build the reverse map and
+# refuse if that reverse is not one-to-one.
+$fwd  = [ordered]@{}                                                    # legacy -> api, for reporting
+$rev  = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+$dupe = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$n = 0
+
+foreach ($line in [IO.File]::ReadAllLines($Sdl)) {
+    $n++
+    $s = $line.Trim()
+    if (-not $s -or $s.StartsWith('#')) { continue }
+    $eq = $s.IndexOf('=')                       # split on the FIRST = only
+    if ($eq -lt 1) {
+        Write-Host "  SDL line ${n} has no '=' and was ignored: $s" -ForegroundColor Yellow
+        continue
+    }
+    $legacy = $s.Substring(0, $eq).Trim()
+    $api    = $s.Substring($eq + 1).Trim()
+    if (-not $legacy -or -not $api) {
+        Write-Host "  SDL line ${n} is incomplete and was ignored: $s" -ForegroundColor Yellow
+        continue
+    }
+    $fwd[$legacy] = $api
+    if ($rev.ContainsKey($api)) { [void]$dupe.Add($api) } else { $rev[$api] = $legacy }
+}
+
+if ($rev.Count -eq 0) { Write-Host "  No usable mappings in $Sdl" -ForegroundColor Red; Stop-Script 2 }
+
+Write-Host ''
+Write-Host "  csv  : $Csv"
+Write-Host "  sdl  : $Sdl   ($($rev.Count) mappings)"
+Write-Host "  out  : $Out"
+
+if ($dupe.Count -gt 0) {
+    Write-Host ''
+    Write-Host '  *** The SDL maps more than one column to the same API name. ***' -ForegroundColor Red
+    foreach ($d in $dupe) {
+        $who = @($fwd.GetEnumerator() | Where-Object { $_.Value -ieq $d } | ForEach-Object { $_.Key })
+        Write-Host "      $d  <-  $($who -join ' , ')" -ForegroundColor Red
+    }
+    Write-Host '      A header of that API name could become either legacy name, and' -ForegroundColor Red
+    Write-Host '      there is no way to tell which. Fix the SDL, then re-run.' -ForegroundColor Red
+    Stop-Script 1
+}
+
+# --- read the CSV header ----------------------------------------------------
+# StreamReader with BOM detection consumes a UTF-8 BOM, so the first header name
+# compares cleanly instead of carrying an invisible three bytes in front of it.
+$reader = [IO.StreamReader]::new($Csv, $true)
+$header = $reader.ReadLine()
+if ($null -eq $header) { $reader.Close(); Write-Host '  CSV is empty.' -ForegroundColor Red; Stop-Script 2 }
+$cols = $header -split ','
+
+# --- build the new header ---------------------------------------------------
+$new = New-Object 'System.Collections.Generic.List[string]'
+$changed = 0
+$already = 0
+$unmapped = New-Object 'System.Collections.Generic.List[string]'
+$table = New-Object 'System.Collections.Generic.List[object]'
+
+foreach ($c in $cols) {
+    $t = $c.Trim()
+    if ($rev.ContainsKey($t)) {
+        $to = $rev[$t]
+        $new.Add($to); $changed++
+        $table.Add([pscustomobject]@{ From = $t; To = $to; Note = '' })
+    }
+    elseif ($fwd.Contains($t)) {
+        # already a legacy name the SDL knows - leave it exactly as it is
+        $new.Add($t); $already++
+        $table.Add([pscustomobject]@{ From = $t; To = $t; Note = 'already an SDL column name' })
+    }
+    else {
+        $new.Add($t); $unmapped.Add($t)
+        $table.Add([pscustomobject]@{ From = $t; To = $t; Note = 'NOT IN SDL - kept as-is' })
+    }
+}
+
+Write-Host ''
+Write-Host '  ---- header changes ----'
+$table | ForEach-Object {
+    $arrow = if ($_.From -ne $_.To) { '->' } else { '  ' }
+    "  {0,-38} {1} {2,-30} {3}" -f $_.From, $arrow, $_.To, $_.Note
+}
+Write-Host ''
+Write-Host "  columns          : $($cols.Count)"
+Write-Host "  renamed          : $changed"
+if ($already -gt 0)         { Write-Host "  already correct  : $already" }
+if ($unmapped.Count -gt 0)  { Write-Host "  NOT in the SDL   : $($unmapped.Count)" -ForegroundColor Yellow }
+
+# columns the SDL expects that this CSV does not have
+$missing = @($fwd.Keys | Where-Object { $new -notcontains $_ })
+if ($missing.Count -gt 0) {
+    Write-Host ''
+    Write-Host "  The SDL also expects $($missing.Count) column(s) this file does not contain:" -ForegroundColor Yellow
+    $missing | Select-Object -First 15 | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
+    Write-Host '      Harmless in itself - the load simply will not set those fields.' -ForegroundColor Yellow
+}
+
+if ($unmapped.Count -gt 0) {
+    Write-Host ''
+    Write-Host '  WARNING: the columns above that are NOT in the SDL will be DROPPED by' -ForegroundColor Yellow
+    Write-Host '  the loader, and dropping any column forces the slow row-rebuild path' -ForegroundColor Yellow
+    Write-Host '  (~6 rows/sec instead of ~9,400) which also refuses any CSV containing' -ForegroundColor Yellow
+    Write-Host '  a double quote or an exclamation mark. Add them to the SDL, or remove' -ForegroundColor Yellow
+    Write-Host '  them from the extract with drop-column.ps1.' -ForegroundColor Yellow
+}
+
+if ($changed -eq 0 -and $already -eq 0) {
+    Write-Host ''
+    Write-Host '  Nothing matched the SDL at all - is this the right SDL for this file?' -ForegroundColor Red
+    Stop-Script 1
+}
+
+# --- confirm ----------------------------------------------------------------
+if ($interactive -and -not $Force) {
+    Write-Host ''
+    $go = Clean-Path (Read-Host '  Write the new file? (Y/n)')
+    if ($go -match '^(n|no)$') { $reader.Close(); Write-Host '  Nothing written.' -ForegroundColor Cyan; Stop-Script 1 }
+}
+if ((Test-Path -LiteralPath $Out) -and -not $Force) {
+    $ow = if ($interactive) { Clean-Path (Read-Host "  $Out exists. Overwrite? (y/N)") } else { 'y' }
+    if ($ow -notmatch '^(y|yes)$') { $reader.Close(); Write-Host '  Nothing written.' -ForegroundColor Cyan; Stop-Script 1 }
+}
+
+# --- write ------------------------------------------------------------------
+# New header, then every data line copied through unchanged. Nothing splits or
+# rebuilds a data row, so values cannot be reformatted or shifted.
+$writer = [IO.StreamWriter]::new($Out, $false, [Text.UTF8Encoding]::new($false))
+$writer.NewLine = "`r`n"
+$rows = 0
+$quotes = 0
+try {
+    $writer.WriteLine(($new -join ','))
+    while ($null -ne ($line = $reader.ReadLine())) {
+        if ($line.Contains('"')) { $quotes++ }
+        $writer.WriteLine($line)
+        $rows++
+    }
+}
+finally { $reader.Close(); $writer.Close() }
+
+$outLines = [IO.File]::ReadAllLines($Out).Count
+
+Write-Host ''
+Write-Host "  written          : $Out"
+Write-Host "  data rows copied : $rows  (+1 header = $outLines lines)"
+
+if ($outLines -ne $rows + 1) {
+    Write-Host '  *** LINE COUNT MISMATCH - do not load this file. ***' -ForegroundColor Red
+    Stop-Script 1
+}
+if ($quotes -gt 0) {
+    Write-Host ''
+    Write-Host "  NOTE: $quotes data row(s) contain a double quote. Copied through" -ForegroundColor Yellow
+    Write-Host '  untouched, which is correct - but an unbalanced quote makes Bulk API' -ForegroundColor Yellow
+    Write-Host '  read past the end of a row and report a DATA VALUE as a field name.' -ForegroundColor Yellow
+    Write-Host '  Run check-AgentSales.ps1 / diagnose-BulkCsv.ps1 on it before loading.' -ForegroundColor Yellow
+}
+Write-Host ''
+Write-Host '  OK - header mapped.' -ForegroundColor Green
+Write-Host '  Copy this file into its Source Data folder, then run the job. The log' -ForegroundColor Cyan
+Write-Host "  must read  SDL mappings: $($rev.Count)  and no 'Unmapped columns dropped'." -ForegroundColor Cyan
+Stop-Script 0
