@@ -4,7 +4,7 @@ REM ===============================================================
 REM  run-AgencyAgentLoad.bat - self-contained chained load:
 REM    Agency -> Agent (active, terminated) -> Agent Number -> Agent Sales
 REM           -> Annuity Product Mix -> APD Contacts -> LSW Annuity Hierarchy
-REM           -> LSW Life Hierarchy
+REM           -> LSW Life Hierarchy -> Life Product Mix
 REM    then, independent of all of the above:  Leads
 REM  Everything in one file. No other script is called.
 REM
@@ -12,21 +12,21 @@ REM  Reads a Data Loader bean (process-conf.xml) + SDL mapping, gets an
 REM  OAuth client-credentials token with curl.exe, runs the load via sf CLI.
 REM
 REM  Usage:  run-AgencyAgentLoad.bat
-REM             runs all ten jobs in order, pauses at the end.
+REM             runs all eleven jobs in order, pauses at the end.
 REM          run-AgencyAgentLoad.bat /q
 REM             same, no pause - for Task Scheduler.
 REM          run-AgencyAgentLoad.bat AgencyUpsert
 REM             runs one named bean only, no chaining. Use this to retry
 REM             AgentNumberUpsert, AgentSalesUpsert, AnnuityProductMixUpsert
-REM             ApdContactUpsert, LswAnnuityHierarchyUpsert, LswLifeHierarchyUpsert or
-REM             LeadUpsert on its own after fixing an error CSV.
+REM             ApdContactUpsert, LswAnnuityHierarchyUpsert, LswLifeHierarchyUpsert,
+REM             LifeProductMixUpsert or LeadUpsert on its own after fixing a CSV.
 REM
 REM  Flow per job:
 REM    Source CSV (Source Data\<Object>\file.csv)
 REM      -> results into  Load Result\<Object>\  as
 REM         success<MMddyyHHmmssfff>.csv / error<MMddyyHHmmssfff>.csv
 REM      -> source CSV moved into the run's single archive folder,
-REM         Archive\Archive_<MMdd yyyyHmmss>\   (shared by all ten jobs)
+REM         Archive\Archive_<MMdd yyyyHmmss>\   (shared by all eleven jobs)
 REM
 REM  Source CSV paths are NOT hardcoded here - each job takes its path from
 REM  dataAccess.name in its own bean, so the bean is the single place a
@@ -40,7 +40,7 @@ REM                             overrides.
 REM    Agent hard error (1)  -> stop; nothing after it runs.
 REM    Agent partial    (2)  -> the two agent FILES are independent of each
 REM                             other, so job 3 still runs - but jobs 4, 5, 6,
-REM                             7, 8 AND 9 are STOPPED. All six need Contacts:
+REM                             7, 8, 9 AND 10 are STOPPED. All seven need them:
 REM                             job 4 resolves them through
 REM                             Agent__r.Master_Agent_ID__c and gets
 REM                             "Foreign key external ID ... not found";
@@ -62,10 +62,11 @@ REM                             that failed job 5 already exists.
 REM    Product Mix partial   -> reported; job 7 still runs, unrelated object.
 REM    APD partial           -> reported; jobs 8 and 9 still run.
 REM    LSW Annuity partial   -> reported; jobs 9 and 10 still run.
-REM    LSW Life partial      -> reported; job 10 still runs, unrelated object.
+REM    LSW Life partial      -> reported; jobs 10 and 11 still run.
+REM    Life Product Mix partial -> reported; job 11 still runs.
 REM    Lead partial          -> reported, nothing downstream to gate.
 REM
-REM  JOB 10 (Lead) HAS NO DATA DEPENDENCY ON ANYTHING ABOVE IT. Every other job either
+REM  JOB 11 (Lead) HAS NO DATA DEPENDENCY ON ANYTHING ABOVE IT. Every other job either
 REM  resolves Contact or upserts onto it, so a failed agent row matters to all
 REM  of them. Lead references neither Agency, Contact nor any agent id, so an
 REM  agent problem has no bearing on whether a Lead row can load. That is why
@@ -74,7 +75,7 @@ REM
 REM  BUT BE CLEAR ABOUT WHAT THAT DOES AND DOES NOT MEAN. Every stop in this
 REM  script - a hard error at any step, AND the AGENTPARTIAL gate - ends the
 REM  whole run through :fatal. So in practice an upstream problem does prevent
-REM  job 10 from being reached, not because Lead depends on anything, but
+REM  job 11 from being reached, not because Lead depends on anything, but
 REM  because the chain stops. Load the Leads on their own in that case:
 REM    run-AgencyAgentLoad.bat LeadUpsert
 REM
@@ -253,7 +254,44 @@ REM
 REM    Also unconfirmed: that Master_ID__c is flagged External Id on THIS
 REM    object. Job 8's flag says nothing about job 9's - they are two objects.
 REM
-REM  JOB 10 - LeadUpsert (added v8 as job 8, renumbered to 10 in v10):
+REM  JOB 10 - LifeProductMixUpsert (added v11, 2026-09-01):
+REM    Life product mix on its own child object, source
+REM    Source Data\LifeProductMix\LifeProductMix.csv, mapping
+REM    Config\LifeProductMixMapping.sdl, external id Master_ID__c.
+REM
+REM    The LIFE counterpart of job 6's annuity product mix, and the same shape
+REM    in every respect that matters:
+REM
+REM      Master_ID__c   the UPSERT KEY on this object. Does NOT need to
+REM                     pre-exist - a new value INSERTS, a matching value
+REM                     UPDATES. A mixed file is normal.
+REM      the Contact lookup column ("__r." in the SDL) is a FOREIGN KEY and its
+REM                     value MUST already be in the org, or that row FAILS with
+REM                       INVALID_FIELD: Foreign key external ID: 71 not found
+REM                       for field Master_Agent_ID__c in entity Contact
+REM
+REM    SAFE DIRECTION, like jobs 6, 8 and 9. The agent id is a foreign key on a
+REM    child object, not an upsert key on Contact, so an unknown agent cannot
+REM    create a junk Contact - it only fails that row. Count the overlap first
+REM    so a run is not wasted:
+REM      prep-AnnuityProductMix.ps1 -In LifeProductMix.csv
+REM         -DevIds dev3-agent-ids.csv -FkColumn <the __r. column>
+REM    and want "NOT IN ORG : 0".
+REM
+REM    Master_ID__c IS PROBABLY DERIVED here as it is on AnnuityProductMix:
+REM      <agent id padded left to 15 with '0'> + ' ' + Product_Name__c
+REM    If the extract's Master_ID__c encodes a DIFFERENT id from its agent id
+REM    column, it must be rebuilt or it upserts onto the wrong record:
+REM      rebuild-MasterId.ps1        (asks for the path, keeps a .bak)
+REM    Confirm the width from the data first with fill-MasterId.ps1 -Check.
+REM
+REM    THE OBJECT API NAME IS AN ASSUMPTION. The bean says
+REM    NLG_OBJ_LifeProductMix__c, by analogy with NLG_OBJ_AnnuityProductMix__c,
+REM    because it was never stated. Wrong name = invalid sObject type and
+REM    nothing loads. Confirm with:
+REM      sf sobject list -s custom -o dev3cc | findstr /i "productmix"
+REM
+REM  JOB 11 - LeadUpsert (added v8 as job 8, renumbered to 11 in v11):
 REM    Leads: entity Lead, external id SSN_Tax_ID__c, source
 REM    Source Data\Lead\Lead.csv, mapping Config\LeadMapping.sdl.
 REM
@@ -301,7 +339,7 @@ REM      location Config\clientcreds.json; override in the bean with
 REM        <entry key="sfdc.credentialsFile" value="Config\dev3cc.json"/>
 REM      (no drive letter = relative to the NLG root). Exactly ONE OAuth
 REM      round trip happens, before any job starts. "sf org login
-REM      access-token -p" persists it under the alias, so all ten jobs
+REM      access-token -p" persists it under the alias, so all eleven jobs
 REM      reuse that one login - no re-authentication between jobs.
 REM      The single exception is a session that EXPIRES mid-run: that job
 REM      fetches a replacement and retries itself once. That is recovery,
@@ -330,7 +368,7 @@ REM ---------------- configuration --------------------------------
 REM  Printed on screen and to the log at the top of every run, so the build
 REM  actually executing is never in doubt. Two runs were diagnosed off
 REM  screenshots that turned out to be an older build.
-set "VERSION=v10 2026-09-01"
+set "VERSION=v11 2026-09-01"
 
 set "ROOT=C:\NLG"
 if defined NLG_ROOT set "ROOT=%NLG_ROOT%"
@@ -350,7 +388,8 @@ set "JOB6=AnnuityProductMixUpsert"
 set "JOB7=ApdContactUpsert"
 set "JOB8=LswAnnuityHierarchyUpsert"
 set "JOB9=LswLifeHierarchyUpsert"
-set "JOB10=LeadUpsert"
+set "JOB10=LifeProductMixUpsert"
+set "JOB11=LeadUpsert"
 
 REM  Minutes to wait for a bulk job to finish. NOT a Salesforce limit - it is
 REM  how long the sf CLI watches before giving up and returning. Exceeding it
@@ -371,7 +410,7 @@ REM  of child failures.
 set "ALLOW_PARTIAL=0"
 
 REM  Set by steps 2 and 3 when an agent job reported failed rows. Read by the
-REM  gate in front of step 4, which stops jobs 4 to 9 - some Contacts
+REM  gate in front of step 4, which stops jobs 4 to 10 - some Contacts
 REM  are missing, so Agent Number rows cannot resolve
 REM  Agent__r.Master_Agent_ID__c, Agent Sales rows (Master_Agent_ID__c) and APD
 REM  rows (Global_ID__c) would create new Contacts instead of updating existing
@@ -397,7 +436,7 @@ set "JTMP=%LOGDIR%\jsonval.tmp"
 
 echo(
 echo(  run-AgencyAgentLoad %VERSION%
-echo(  10 jobs ^| row-count guard ACTIVE ^| findstr body copy ^| no "more" ^| wait %WAITMIN% min
+echo(  11 jobs ^| row-count guard ACTIVE ^| findstr body copy ^| no "more" ^| wait %WAITMIN% min
 call :log "=== run-AgencyAgentLoad %VERSION% starting ==="
 if not exist "%BEAN%" (set "ERRMSG=Bean not found: %BEAN%" & goto :fatal)
 if not exist "%CURL%" (set "ERRMSG=curl.exe not found at %CURL% - needs Windows 10 1803 or later" & goto :fatal)
@@ -427,7 +466,7 @@ REM  which makes a clean re-run awkward.
 set "PREOK=1"
 echo(
 echo(  Pre-flight
-for %%J in ("%JOB1%" "%JOB2%" "%JOB3%" "%JOB4%" "%JOB5%" "%JOB6%" "%JOB7%" "%JOB8%" "%JOB9%" "%JOB10%") do call :checkjob %%J
+for %%J in ("%JOB1%" "%JOB2%" "%JOB3%" "%JOB4%" "%JOB5%" "%JOB6%" "%JOB7%" "%JOB8%" "%JOB9%" "%JOB10%" "%JOB11%") do call :checkjob %%J
 if not "%PREOK%"=="1" (set "ERRMSG=One or more source CSVs are missing - nothing was loaded" & goto :fatal)
 
 REM ---------------- authenticate once for the whole run -----------
@@ -459,10 +498,12 @@ call :ensureauth "%JOB9%"
 if errorlevel 1 goto :fatal
 call :ensureauth "%JOB10%"
 if errorlevel 1 goto :fatal
+call :ensureauth "%JOB11%"
+if errorlevel 1 goto :fatal
 
-REM ---------------- 1/10 ------------------------------------------
+REM ---------------- 1/11 ------------------------------------------
 echo(
-echo(  --- 1/10  %JOB1% ------------------------------------
+echo(  --- 1/11  %JOB1% ------------------------------------
 call :runjob "%JOB1%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB1% exit code %RC%"
@@ -475,27 +516,27 @@ goto :fatal
 call :log "%JOB1% had failed rows - continuing because ALLOW_PARTIAL=1"
 set "WORST=2"
 
-REM ---------------- 2/10 ------------------------------------------
+REM ---------------- 2/11 ------------------------------------------
 :step2
 echo(
-echo(  --- 2/10  %JOB2% -------------------------------
+echo(  --- 2/11  %JOB2% -------------------------------
 call :runjob "%JOB2%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB2% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB2% failed - %JOB3%, %JOB4%, %JOB5%, %JOB6%, %JOB7%, %JOB8%, %JOB9% and %JOB10% skipped. See %LOGDIR%\%JOB2%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB2% failed - %JOB3% to %JOB11% skipped. See %LOGDIR%\%JOB2%.log" & goto :fatal)
 if "%RC%"=="2" (set "WORST=2" & set "AGENTPARTIAL=1")
 
-REM ---------------- 3/10 ------------------------------------------
+REM ---------------- 3/11 ------------------------------------------
 echo(
-echo(  --- 3/10  %JOB3% ---------------------------
+echo(  --- 3/11  %JOB3% ---------------------------
 call :runjob "%JOB3%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB3% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB3% failed - %JOB4%, %JOB5%, %JOB6%, %JOB7%, %JOB8%, %JOB9% and %JOB10% skipped. See %LOGDIR%\%JOB3%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB3% failed - %JOB4% to %JOB11% skipped. See %LOGDIR%\%JOB3%.log" & goto :fatal)
 if "%RC%"=="2" (set "WORST=2" & set "AGENTPARTIAL=1")
 
-REM ---------------- gate in front of jobs 4, 5, 6, 7, 8 and 9 -----
-REM  All six of these jobs need the Contacts to be there already:
+REM ---------------- gate in front of jobs 4 to 10 -----------------
+REM  All seven of these jobs need the Contacts to be there already:
 REM    job 4 resolves them by Agent__r.Master_Agent_ID__c, so a Contact that
 REM          failed above becomes a foreign-key failure.
 REM    job 5 upserts ON Master_Agent_ID__c, so a Contact that failed above is
@@ -506,7 +547,7 @@ REM          a name column.
 REM    job 6 resolves them by Contact_ID__r.Master_Agent_ID__c - the same
 REM          foreign-key failure as job 4. It cannot corrupt anything, but a
 REM          run where most rows fail is still a wasted run.
-REM    jobs 8 and 9 resolve them by Contact__r.Master_Agent_ID__c - the same
+REM    jobs 8, 9 and 10 resolve them through a Contact lookup - the same
 REM          foreign-key failure as jobs 4 and 6. Neither can corrupt anything,
 REM          but a run where most rows fail is still a wasted run.
 REM    job 7 upserts ON Contact as well, so it carries job 5's risk: a missing
@@ -522,103 +563,120 @@ REM    run-AgencyAgentLoad.bat AnnuityProductMixUpsert
 REM    run-AgencyAgentLoad.bat ApdContactUpsert
 REM    run-AgencyAgentLoad.bat LswAnnuityHierarchyUpsert
 REM    run-AgencyAgentLoad.bat LswLifeHierarchyUpsert
+REM    run-AgencyAgentLoad.bat LifeProductMixUpsert
 if "%AGENTPARTIAL%"=="0" goto :step4
 if "%ALLOW_PARTIAL%"=="1" (
-  call :log "An agent job had failed rows - running %JOB4%, %JOB5%, %JOB6%, %JOB7%, %JOB8% and %JOB9% anyway because ALLOW_PARTIAL=1"
+  call :log "An agent job had failed rows - running %JOB4% to %JOB10% anyway because ALLOW_PARTIAL=1"
   goto :step4
 )
-set "ERRMSG=An agent job completed with failed rows, so %JOB4%, %JOB5%, %JOB6%, %JOB7%, %JOB8% and %JOB9% were all skipped - job 4 resolves Contacts by Master_Agent_ID__c and would hit foreign-key errors, job 5 upserts on that same key and job 7 upserts on Global_ID__c, so both would CREATE new Contacts instead of updating the agents, job 6 resolves the same key through Contact_ID__r and would hit foreign-key errors too. Fix the agent error CSV, reload the agents, then run each of them in single-job mode. Note this stop also ends the run before %JOB10%, which does not depend on the agents at all - run LeadUpsert on its own."
+set "ERRMSG=An agent job completed with failed rows, so %JOB4% to %JOB10% were all skipped - job 4 resolves Contacts by Master_Agent_ID__c and would hit foreign-key errors, job 5 upserts on that same key and job 7 upserts on Global_ID__c, so both would CREATE new Contacts instead of updating the agents, job 6 resolves the same key through Contact_ID__r and would hit foreign-key errors too. Fix the agent error CSV, reload the agents, then run each of them in single-job mode. Note this stop also ends the run before %JOB11%, which does not depend on the agents at all - run LeadUpsert on its own."
 goto :fatal
 
-REM ---------------- 4/10 ------------------------------------------
+REM ---------------- 4/11 ------------------------------------------
 :step4
 echo(
-echo(  --- 4/10  %JOB4% -------------------------------
+echo(  --- 4/11  %JOB4% -------------------------------
 call :runjob "%JOB4%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB4% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB4% failed - %JOB5%, %JOB6%, %JOB7%, %JOB8%, %JOB9% and %JOB10% skipped. See %LOGDIR%\%JOB4%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB4% failed - %JOB5% to %JOB11% skipped. See %LOGDIR%\%JOB4%.log" & goto :fatal)
 if "%RC%"=="2" set "WORST=2"
 
-REM ---------------- 5/10 ------------------------------------------
+REM ---------------- 5/11 ------------------------------------------
 REM  No gate on job 4's result: job 5 writes to Contact and does not touch
 REM  Agent_Number__c, so a partial job 4 is irrelevant to it.
 echo(
-echo(  --- 5/10  %JOB5% -------------------------------
+echo(  --- 5/11  %JOB5% -------------------------------
 call :runjob "%JOB5%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB5% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB5% failed - %JOB6%, %JOB7%, %JOB8%, %JOB9% and %JOB10% skipped. See %LOGDIR%\%JOB5%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB5% failed - %JOB6% to %JOB11% skipped. See %LOGDIR%\%JOB5%.log" & goto :fatal)
 if "%RC%"=="2" set "WORST=2"
 
-REM ---------------- 6/10 ------------------------------------------
+REM ---------------- 6/11 ------------------------------------------
 REM  No gate on job 5's result either: job 6 writes to
 REM  NLG_OBJ_AnnuityProductMix__c and only READS Contact through the
 REM  Contact_ID__r.Master_Agent_ID__c lookup. A partial job 5 means some
 REM  agents are missing sales figures, which has no bearing on whether their
 REM  product-mix rows can resolve.
 echo(
-echo(  --- 6/10  %JOB6% ---------------------------
+echo(  --- 6/11  %JOB6% ---------------------------
 call :runjob "%JOB6%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB6% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB6% failed - %JOB7%, %JOB8%, %JOB9% and %JOB10% skipped. See %LOGDIR%\%JOB6%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB6% failed - %JOB7% to %JOB11% skipped. See %LOGDIR%\%JOB6%.log" & goto :fatal)
 if "%RC%"=="2" set "WORST=2"
 
-REM ---------------- 7/10 ------------------------------------------
+REM ---------------- 7/11 ------------------------------------------
 REM  No gate on job 6's result: job 6 writes NLG_OBJ_AnnuityProductMix__c and
 REM  job 7 writes Contact, so they do not touch the same records at all.
 REM  The gate that matters for job 7 is the AGENTPARTIAL one above, because
 REM  job 7 shares job 5's upsert key and therefore job 5's orphan risk.
 echo(
-echo(  --- 7/10  %JOB7% -------------------------------
+echo(  --- 7/11  %JOB7% -------------------------------
 call :runjob "%JOB7%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB7% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB7% failed - %JOB8%, %JOB9% and %JOB10% skipped. See %LOGDIR%\%JOB7%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB7% failed - %JOB8% to %JOB11% skipped. See %LOGDIR%\%JOB7%.log" & goto :fatal)
 if "%RC%"=="2" set "WORST=2"
 
-REM ---------------- 8/10 ------------------------------------------
+REM ---------------- 8/11 ------------------------------------------
 REM  No gate on job 7's result: job 8 writes its own object and only READS
 REM  Contact through the Contact__r.Master_Agent_ID__c lookup, so whether an
 REM  agent got its APD fields has no bearing on whether a hierarchy row can
 REM  resolve. The gate that matters for job 8 is the AGENTPARTIAL one above.
 echo(
-echo(  --- 8/10  %JOB8% ------------------------
+echo(  --- 8/11  %JOB8% ------------------------
 call :runjob "%JOB8%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB8% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB8% failed - %JOB9% and %JOB10% skipped. See %LOGDIR%\%JOB8%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB8% failed - %JOB9%, %JOB10% and %JOB11% skipped. See %LOGDIR%\%JOB8%.log" & goto :fatal)
 if "%RC%"=="2" set "WORST=2"
 
-REM ---------------- 9/10 -----------------------------------------
+REM ---------------- 9/11 -----------------------------------------
 REM  No gate on job 8's result. Both LSW hierarchy jobs write their own
 REM  objects and only READ Contact through a lookup, so they are independent
 REM  of each other - a partial job 8 says nothing about whether a LIFE
 REM  hierarchy row can resolve. The gate that matters for job 9 is the
 REM  AGENTPARTIAL one above.
 echo(
-echo(  --- 9/10  %JOB9% ---------------------------
+echo(  --- 9/11  %JOB9% ---------------------------
 call :runjob "%JOB9%"
 set "RC=%ERRORLEVEL%"
 call :log "%JOB9% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB9% failed - %JOB10% skipped. See %LOGDIR%\%JOB9%.log" & goto :fatal)
+if "%RC%"=="1" (set "ERRMSG=%JOB9% failed - %JOB10% and %JOB11% skipped. See %LOGDIR%\%JOB9%.log" & goto :fatal)
 if "%RC%"=="2" set "WORST=2"
 
-REM ---------------- 10/10 ----------------------------------------
+REM ---------------- 10/11 ----------------------------------------
+REM  No gate on job 9's result. Job 10 is the LIFE counterpart of job 6's
+REM  annuity product mix: its own child object, reading Contact only through a
+REM  lookup, so nothing job 6 to 9 did can invalidate it. The gate that matters
+REM  for job 10 is the AGENTPARTIAL one above.
+REM  It sits here rather than next to job 6 purely because it was added later -
+REM  grouping the two product-mix jobs together is cosmetic, they are
+REM  independent of each other.
+echo(
+echo(  --- 10/11  %JOB10% ----------------------------
+call :runjob "%JOB10%"
+set "RC=%ERRORLEVEL%"
+call :log "%JOB10% exit code %RC%"
+if "%RC%"=="1" (set "ERRMSG=%JOB10% failed - %JOB11% skipped. See %LOGDIR%\%JOB10%.log" & goto :fatal)
+if "%RC%"=="2" set "WORST=2"
+
+REM ---------------- 11/11 ----------------------------------------
 REM  Standalone. Lead has no reference to Agency, Contact or any agent id, so
 REM  nothing above can invalidate it, and it is not part of the AGENTPARTIAL
 REM  condition. It sits last purely because it was added last.
 REM  Note that any upstream stop - hard error or the agent gate - ends the run
-REM  through :fatal, so job 10 is simply never reached in those cases. Load the
+REM  through :fatal, so job 11 is simply never reached in those cases. Load the
 REM  Leads on their own then:
 REM    run-AgencyAgentLoad.bat LeadUpsert
 echo(
-echo(  --- 10/10  %JOB10% -------------------------------------
-call :runjob "%JOB10%"
+echo(  --- 11/11  %JOB11% -----------------------------------
+call :runjob "%JOB11%"
 set "RC=%ERRORLEVEL%"
-call :log "%JOB10% exit code %RC%"
-if "%RC%"=="1" (set "ERRMSG=%JOB10% failed. See %LOGDIR%\%JOB10%.log" & goto :fatal)
+call :log "%JOB11% exit code %RC%"
+if "%RC%"=="1" (set "ERRMSG=%JOB11% failed. See %LOGDIR%\%JOB11%.log" & goto :fatal)
 if "%RC%"=="2" set "WORST=2"
 
 REM ---------------- report ---------------------------------------
