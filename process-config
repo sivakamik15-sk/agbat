@@ -162,4 +162,18 @@
         </map>
     </property>
 </bean>
+<bean id="NlProductHierarchyUpsert" class="com.salesforce.dataloader.process.ProcessRunner" scope="singleton">
+    <description>Upsert NL Product Hierarchy on Master ID.</description>
+    <property name="name" value="NlProductHierarchyUpsert"/>
+    <property name="configOverrideMap">
+        <map>
+            <entry key="sfdc.entity" value="NL_Product_Hierarchy__c"/>
+            <entry key="process.operation" value="upsert"/>
+            <entry key="sfdc.externalIdField" value="Master_ID__c"/>
+            <entry key="process.mappingFile" value="C:\NLG\Config\NLProductHierarchyMapping.sdl"/>
+            <entry key="dataAccess.name" value="C:\NLG\Source Data\NLProductHierarchy\NLProductHierarchy.csv"/>
+            <entry key="dataAccess.type" value="csvRead"/>
+        </map>
+    </property>
+</bean>
 </beans>
