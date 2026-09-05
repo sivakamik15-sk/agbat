@@ -1,0 +1,33 @@
+
+Q1 — Do L&C cases actually get closed?
+SELECT Status, COUNT(Id) total
+FROM Case
+WHERE RecordType.DeveloperName = 'L_C_Cases'
+AND CreatedDate = LAST_N_DAYS:180
+GROUP BY Status
+ORDER BY COUNT(Id) DESC
+
+Q2 — Do L&C tasks actually get completed?
+SELECT Status, COUNT(Id) total
+FROM Task
+WHERE RecordType.DeveloperName = 'L_C_Task'
+AND CreatedDate = LAST_N_DAYS:180
+GROUP BY Status
+ORDER BY COUNT(Id) DESC
+
+Q3 — How much of this is annuity (your scope)?
+SELECT Policy__r.RecordType.DeveloperName rt, COUNT(Id) total
+FROM Case
+WHERE RecordType.DeveloperName = 'L_C_Cases'
+AND CreatedDate = LAST_N_DAYS:180
+GROUP BY Policy__r.RecordType.DeveloperName
+ORDER BY COUNT(Id) DESC
+
+Q4 — Test records you can use later
+SELECT CaseNumber, Status, Policy__r.Name, Policy__r.Communicator__r.Name
+FROM Case
+WHERE RecordType.DeveloperName = 'L_C_Cases'
+AND IsClosed = false
+AND Policy__r.RecordType.DeveloperName = 'Annuity'
+ORDER BY CreatedDate DESC
+LIMIT 20
