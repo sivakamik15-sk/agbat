@@ -1,3 +1,14 @@
-The solution has been validated with Salesforce CLI v2.136.8 (win32-x64,
-Node v22.19.0). The Windows x64 installer bundles Node.js, so a separate Node
-installation is not required. Confirm the install on each server with sf --version.
+The loader runs on the UAT server NLGTPTVAPP444 and the Production server NLGPPTVAPP447.
+
+Before starting the data load, ensure the following are completed in Salesforce and on the loader server:
+
+1. Install the Salesforce CLI (sf) on the UAT and Production servers.
+2. Create an External Client App in Salesforce with the Client Credentials Flow enabled.
+3. Record the Consumer Key and Consumer Secret from the External Client App.
+4. Assign a run-as user to the Client Credentials Flow with the API Enabled permission.
+5. Ensure the run-as user has read/write access to all objects and fields used by the loads.
+6. Confirm every field used as an upsert key is flagged External ID or Unique on its object.
+7. Confirm outbound HTTPS (443) access from the server to the Salesforce My Domain URL.
+8. Place the bean file, SDL mapping files and clientcreds.json in the Config folder.
+
+Note: The solution has been validated with Salesforce CLI v2.136.8 (win32-x64, Node v22.19.0). The Windows x64 installer bundles Node.js, so a separate Node installation is not required. Confirm the install on each server with sf --version.
