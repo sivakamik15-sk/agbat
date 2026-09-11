@@ -65,6 +65,7 @@ The Data Loader key file (dataLoader.key) is no longer used once these entries a
 
 How Authentication Works
 
+
 Authentication Flow: The load process authenticates using the OAuth 2.0 Client Credentials Flow. No user name or password is involved, and no interactive login takes place.
 
 The sequence for each run is:
@@ -79,8 +80,9 @@ POST https://<My Domain URL>/services/oauth2/token
 
 3. Salesforce validates the credentials against the External Client App and returns an access token and the instance URL. The token is issued for the app's Run As user.
 4. The process stores the access token against the org alias so that all subsequent Salesforce CLI commands in the run use it.
-5. Every job in the run reuses that one token. Autore the jobs start — not once per job.
-6. If the token expires during a long run, the affected job requests a replacement and retries itself once. This is recovery, not a routine re-authentication, and it is recorded i
-                                                                                                                              Note: The Client Credentials Flow issues a tokened on the External Client App. Every recordinserted, updated or deleted by the load is created and audited against that user, and the load can only access objects and fields that user is permitted to see.
+5. Every job in the run reuses that one token. Authentication happens once, before the jobs start — not once per job.
+6. If the token expires during a long run, the affected job requests a replacement and retries itself once. This is recovery, not a routine re-authentication, and it is recorded in the log.
+
+▎ Note: The Client Credentials Flow issues a tokened on the External Client App. Every recordinserted, updated or deleted by the load is created and audited against that user, and the load can only access objects and fields that user is permitted to see.
 
 ▎ Note: The Client Credentials Flow does not issuen expires, a new one is requested using the sameclient credentials.
