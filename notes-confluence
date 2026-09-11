@@ -12,3 +12,53 @@ Before starting the data load, ensure the following are completed in Salesforce 
 8. Place the bean file, SDL mapping files and clientcreds.json in the Config folder.
 
 Note: The solution has been validated with Salesforce CLI v2.136.8 (win32-x64, Node v22.19.0). The Windows x64 installer bundles Node.js, so a separate Node installation is not required. Confirm the install on each server with sf --version.
+point 7:
+Test-NetConnection <your-salesforce-domain> -Port 443
+
+Perform these steps on the UAT server (NLGTPTVAPP444) first, then repeat on the Production server (NLGPPTVAPP447).
+
+Step 1 – Install the Salesforce CLI
+
+Download and run the Salesforce CLI Windows x64 installer. Node.js is bundled with the installer, so a separate Node installation is not required.
+
+Step 2 – Verify the installation
+
+sf --version
+
+Expected output:
+
+@salesforce/cli/2.136.8 win32-x64 node-v22.19.0
+
+Step 3 – Confirm curl.exe is available
+
+where curl
+
+curl.exe is used to request the OAuth token and is included with Windows Server 2019 and later.
+
+Step 4 – Add the credentials file
+
+Create <root>\Config\clientcreds.json with the External Client App details recorded earlier:
+
+{
+  "domain":       "<My Domain URL of the target org>",
+  "clientId":     "<Consumer Key>",
+  "clientSecret": "<Consumer Secret>",
+  "org":          "<alias>"
+}
+
+This file replaces the stored username and password. It is the only file that differs between UAT and Production.
+
+Step 5 – Remove the old authentication entries from the bean file
+
+In <root>\Config\process-conf.xml, delete the following entries from every bean:
+
+- sfdc.endpoint
+- sfdc.username
+- sfdc.password
+- process.encryptionKeyFile
+
+Leave all other entries unchanged. Each bean retains its object, operation, external ID field, mapping file and source file, so the load definitions and sequence are unaffected.
+
+The Data Loader key file (dataLoader.key) is no longer used once these entries are removed, and can be retired in line with your key-handling policy.
+
+▎ Note: No sf org login step is required. The load process requests its own token from the External Client App at the start of the run.
