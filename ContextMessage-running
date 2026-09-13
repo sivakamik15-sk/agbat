@@ -1,0 +1,21 @@
+apex
+Id recId = 'PASTE_YOUR_ID_HERE';
+
+// 1. How many active rules exist, broken down by object
+Map<String, Integer> counts = new Map<String, Integer>();
+for (RuleCriteria__mdt rc : [SELECT ForObject__r.ObjectAPIName__c
+                             FROM RuleCriteria__mdt
+                             WHERE isActive__c = true]) {
+    String obj = rc.ForObject__r.ObjectAPIName__c;
+    counts.put(obj, counts.containsKey(obj) ? counts.get(obj) + 1 : 1);
+}
+System.debug('### Active rules per object: ' + counts);
+System.debug('### This record is a: ' + recId.getSobjectType());
+
+// 2. Run the engine and measure what it costs
+Integer before = Limits.getQueries();
+List<ContextualMessage__mdt> msgs = ContextualMessageRuleEngineGenerator.getMessage(recId);
+
+System.debug('### Banners matched: ' + msgs.size());
+System.debug('### Queries used by the engine: ' + (Limits.getQueries() - before));
+System.debug('### Total queries: ' + Limits.getQueries() + ' of ' + Limits.getLimitQueries());
