@@ -19,3 +19,12 @@ List<ContextualMessage__mdt> msgs = ContextualMessageRuleEngineGenerator.getMess
 System.debug('### Banners matched: ' + msgs.size());
 System.debug('### Queries used by the engine: ' + (Limits.getQueries() - before));
 System.debug('### Total queries: ' + Limits.getQueries() + ' of ' + Limits.getLimitQueries());
+
+
+Id recId = 'PASTE_YOUR_ID_HERE';
+
+for (Integer i = 1; i <= 10; i++) {
+    System.debug('### Call ' + i + ' - queries used so far: ' + Limits.getQueries());
+    ContextualMessageRuleEngineGenerator.getMessage(recId);
+}
+System.debug('### Finished without error - unexpected');
