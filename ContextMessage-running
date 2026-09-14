@@ -31,35 +31,41 @@ System.debug('### Finished without error - unexpected');
 
 
 
-Integer total = 0, maxV = 0, minV = 999999, n = 0;
-String biggest = '';
-Map<String, Integer> byObject = new Map<String, Integer>();
+apex
+// ordered longest-first so ProductName__c is matched before Name
+List<String> fields = new List<String>{
+    'LSW_Life_Agent_Number__c','Global_Agent_ID__c','PartyIdentifier__c',
+    'MailingPostalCode','PolicyNumber__c','PolicyGroup__c','ProductName__c',
+    'AgencyNumber__c','SystemCode__c','isEmailBounced','RecordTypeId',
+    'AccountId','Policy__c','Role__c','Name'
+};
+
+Map<String, Integer> counts = new Map<String, Inte
+List<String> unmatched = new List<String>();
 
 for (RuleCriteria__mdt rc : [SELECT Label, Query__c, ForObject__r.Label
-                             FROM RuleCriteria__mdt
-                             WHERE isActive__c = true]) {
+                             FROM RuleCriteria__md{
 
     if (String.isBlank(rc.Query__c)) { continue; }
 
-    // count values in the WHERE clause only - the SELECT clause has commas too
-    String q = rc.Query__c;
-    Integer fromAt = q.toLowerCase().indexOf(' from ');
-    String tail = (fromAt > 0) ? q.substring(fromAt) : q;
-    Integer v = tail.countMatches(',') + 1;
+    // only look at the WHERE clause - the SELECT
+    String q = rc.Query__c.toLowerCase();
+    Integer whereAt = q.indexOf(' where ');
+    String clause = (whereAt > 0) ? q.substring(whereAt) : q;
 
-    n++;
-    total += v;
-    if (v > maxV) { maxV = v; biggest = rc.Label; }
-    if (v < minV) { minV = v; }
-
-    String obj = rc.ForObject__r.Label;
-    byObject.put(obj, (byObject.containsKey(obj) ? byObject.get(obj) : 0) + v);
-
-    if (v >= 20) { System.debug('### BIG: ' + v + ' values -- ' + rc.Label); }
+    Boolean found = false;
+    for (String f : fields) {
+        if (clause.contains(f.toLowerCase())) {
+            String key = rc.ForObject__r.Label + '
+            counts.put(key, (counts.containsKey(key) ? counts.get(key) : 0) + 1);
+            clause = clause.replace(f.toLowerCase(nting
+            found = true;
+        }
+    }
+    if (!found) { unmatched.add(rc.Label); }
 }
 
-System.debug('### Rules counted: ' + n);
-System.debug('### TOTAL values: ' + total);
-System.debug('### MAX: ' + maxV + '  (' + biggest
-System.debug('### MIN: ' + minV);
-System.debug('### Values per Rule Object: ' + byOb
+for (String k : counts.keySet()) {
+    System.debug('### ' + k + ' = ' + counts.get(k
+}
+System.debug('### Unmatched rules: ' + unmatched);
