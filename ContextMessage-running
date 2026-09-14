@@ -31,41 +31,49 @@ System.debug('### Finished without error - unexpected');
 
 
 
-apex
-// ordered longest-first so ProductName__c is matched before Name
-List<String> fields = new List<String>{
-    'LSW_Life_Agent_Number__c','Global_Agent_ID__c','PartyIdentifier__c',
-    'MailingPostalCode','PolicyNumber__c','PolicyGroup__c','ProductName__c',
-    'AgencyNumber__c','SystemCode__c','isEmailBounced','RecordTypeId',
-    'AccountId','Policy__c','Role__c','Name'
-};
 
-Map<String, Integer> counts = new Map<String, Inte
-List<String> unmatched = new List<String>();
+
+
+
+
+
+Map<String, Integer> counts = new Map<String, Integer>();
+
+List<String> fields = new List<String>();
+fields.add('LSW_Life_Agent_Number__c');
+fields.add('Global_Agent_ID__c');
+fields.add('PartyIdentifier__c');
+fields.add('MailingPostalCode');
+fields.add('PolicyNumber__c');
+fields.add('PolicyGroup__c');
+fields.add('ProductName__c');
+fields.add('AgencyNumber__c');
+fields.add('SystemCode__c');
+fields.add('isEmailBounced');
+fields.add('RecordTypeId');
+fields.add('AccountId');
+fields.add('Policy__c');
+fields.add('Role__c');
+fields.add('Name');
 
 for (RuleCriteria__mdt rc : [SELECT Label, Query__c, ForObject__r.Label
-                             FROM RuleCriteria__md{
-
+                             FROM RuleCriteria__mdt WHERE isActive__c = true]) {
     if (String.isBlank(rc.Query__c)) { continue; }
 
-    // only look at the WHERE clause - the SELECT
-    String q = rc.Query__c.toLowerCase();
-    Integer whereAt = q.indexOf(' where ');
-    String clause = (whereAt > 0) ? q.substring(whereAt) : q;
+    String clause = rc.Query__c.toLowerCase();
+    Integer at = clause.indexOf('where');
+    if (at > 0) { clause = clause.substring(at); }
 
-    Boolean found = false;
     for (String f : fields) {
         if (clause.contains(f.toLowerCase())) {
-            String key = rc.ForObject__r.Label + '
-            counts.put(key, (counts.containsKey(key) ? counts.get(key) : 0) + 1);
-            clause = clause.replace(f.toLowerCase(nting
-            found = true;
+            String key = rc.ForObject__r.Label + ' - ' + f;
+            Integer n = counts.containsKey(key) ? counts.get(key) : 0;
+            counts.put(key, n + 1);
+            clause = clause.replace(f.toLowerCase(), 'x');
         }
     }
-    if (!found) { unmatched.add(rc.Label); }
 }
 
 for (String k : counts.keySet()) {
-    System.debug('### ' + k + ' = ' + counts.get(k
+    System.debug('RESULT ' + k + ' = ' + counts.get(k));
 }
-System.debug('### Unmatched rules: ' + unmatched);
