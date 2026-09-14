@@ -28,3 +28,38 @@ for (Integer i = 1; i <= 10; i++) {
     ContextualMessageRuleEngineGenerator.getMessage(recId);
 }
 System.debug('### Finished without error - unexpected');
+
+
+
+Integer total = 0, maxV = 0, minV = 999999, n = 0;
+String biggest = '';
+Map<String, Integer> byObject = new Map<String, Integer>();
+
+for (RuleCriteria__mdt rc : [SELECT Label, Query__c, ForObject__r.Label
+                             FROM RuleCriteria__mdt
+                             WHERE isActive__c = true]) {
+
+    if (String.isBlank(rc.Query__c)) { continue; }
+
+    // count values in the WHERE clause only - the SELECT clause has commas too
+    String q = rc.Query__c;
+    Integer fromAt = q.toLowerCase().indexOf(' from ');
+    String tail = (fromAt > 0) ? q.substring(fromAt) : q;
+    Integer v = tail.countMatches(',') + 1;
+
+    n++;
+    total += v;
+    if (v > maxV) { maxV = v; biggest = rc.Label; }
+    if (v < minV) { minV = v; }
+
+    String obj = rc.ForObject__r.Label;
+    byObject.put(obj, (byObject.containsKey(obj) ? byObject.get(obj) : 0) + v);
+
+    if (v >= 20) { System.debug('### BIG: ' + v + ' values -- ' + rc.Label); }
+}
+
+System.debug('### Rules counted: ' + n);
+System.debug('### TOTAL values: ' + total);
+System.debug('### MAX: ' + maxV + '  (' + biggest
+System.debug('### MIN: ' + minV);
+System.debug('### Values per Rule Object: ' + byOb
