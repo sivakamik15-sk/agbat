@@ -1,0 +1,8 @@
+  {
+      "Id": "RELATED_POSTCODE_DERIVED",
+      "Variant": "info",
+      "Derived": true,
+      "SourceQuery": "SELECT Policy__r.PolicyNumber__c FROM PolicyContact__c WHERE Contact__r.MailingPostalCode LIKE 'REPLACE_POSTCODE%'",
+      "Message": "RELATED TEST - this policy has a contact in the affected postcode.",
+      "PolicyRecords": ["REPLACE_POLICY_1", "REPLACE_POLICY_2"]
+    }
