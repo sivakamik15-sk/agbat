@@ -1,0 +1,14 @@
+ {
+      "Id": "RELATED_POLICY_DERIVED",
+      "Variant": "error",
+      "Derived": true,
+      "SourceQuery": "SELECT Contact__c FROM PolicyContact__c WHERE Policy__r.PolicyNumber__c IN ('test12345','717234500')",
+      "Message": "RELATED TEST - this client holds one of the affected policies.",
+      "Conditions": [
+        {
+          "Field": "Id",
+          "Operator": "IN",
+          "Values": ["0030300000L0VVIAA3"]
+        }
+      ]
+    }
