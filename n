@@ -1,0 +1,11 @@
+Id policyId = 'PUT_THE_RECORD_ID_OF_LL013645400_HERE';
+
+Integer before = Limits.getQueries();
+List<ContextualBannerHelper.BannerMessage> msgs =
+    ContextualBannerController.getPolicyMessages(policyId);
+
+System.debug('### messages: ' + msgs.size());
+for (ContextualBannerHelper.BannerMessage m : msgs) {
+    System.debug('### MSG : ' + m.message);
+}
+System.debug('### queries used: ' + (Limits.getQueries() - before));
