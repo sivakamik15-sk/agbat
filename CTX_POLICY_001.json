@@ -1,0 +1,17 @@
+[
+  {
+    "policyRecords": [
+      "LL013645400"
+    ],
+    "message": "GROUP MESSAGE - this policy belongs to the affected group.",
+    "description": "Test rule 1 - a set of policies sharing one message."
+  },
+  {
+    "policyRecords": [
+      "test12345",
+      "717234500"
+    ],
+    "message": "SECOND MESSAGE - this policy is in the second group.",
+    "description": "Test rule 2 - a different set with its own message."
+  }
+]

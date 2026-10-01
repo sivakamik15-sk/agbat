@@ -1,0 +1,9 @@
+[
+  {
+    "policyRecords": [
+      "REPLACE_WITH_A_REAL_POLICY_NUMBER"
+    ],
+    "message": "THIRD MESSAGE - proves a second config file is picked up automatically.",
+    "description": "Test rule 3 - lives in a separate file. No code change was needed to add this file."
+  }
+]

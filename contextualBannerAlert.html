@@ -1,0 +1,12 @@
+<template>
+    <template lwc:if={hasMessages}>
+        <template for:each={messages} for:item="m">
+            <div key={m.key} class={m.cssClass} role="alert"
+                 style="text-align:left; justify-content:left;">
+                <lightning-icon icon-name="utility:warning" variant="warning"
+                                size="small" style="margin-right:2%;"></lightning-icon>
+                <lightning-formatted-rich-text value={m.message}></lightning-formatted-rich-text>
+            </div>
+        </template>
+    </template>
+</template>
