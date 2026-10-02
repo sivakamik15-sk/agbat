@@ -1,0 +1,15 @@
+{
+    "policyRecords": [
+      "POLICY_1",
+      "POLICY_2"
+    ],
+    "message": "FILE 002 - GROUP MESSAGE. This policy is in the affected group.",
+    "description": "Added in a second config file. No code change was needed."
+  },
+  {
+    "policyRecords": [
+      "POLICY_3"
+    ],
+    "message": "FILE 002 - SINGLE MESSAGE. This message is only for one policy.",
+    "description": "Single-policy rule, also in file 002."
+  }
