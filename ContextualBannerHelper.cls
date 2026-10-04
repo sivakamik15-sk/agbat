@@ -1,74 +1,67 @@
 /**
  * ContextualBannerHelper
  *
- * All the logic for the contextual banner. Reads the configuration from
- * static resources and decides which messages apply to a record.
+ * Reads the banner rules from static resources.
  *
- * KEY POINT - SOQL COST
- *   Reading the config costs ONE query no matter how many config files exist,
- *   because every file is fetched in a single query using a name prefix.
+ * ONE RULE PER FILE
+ *   Every static resource holds exactly one rule, so a mistake in one file
+ *   can never affect another rule.
  *
- *       1 query   -> all CTX_POLICY_* config files
- *       1 query   -> the policy record being viewed
- *       --------
- *       2 queries total, fixed, regardless of how many rules are configured.
+ *   {
+ *     "message": "text shown in the banner (HTML allowed)",
+ *     "description": "why the rule exists - never displayed",
+ *     "policyRecords": ["value1", "value2"]
+ *   }
  *
- * NAMING CONVENTION
- *   Static resources must be named with the prefix below, then a number:
- *       CTX_POLICY_001, CTX_POLICY_002, CTX_POLICY_003 ...
- *   Add a new file following that pattern and it is picked up automatically.
- *   No code change is ever needed to add a file or a rule.
+ * NAMING CONVENTION  (the prefix decides which object a file belongs to)
+ *   PolicyMaster__c  ->  CTX_POLICY_001, CTX_POLICY_002, ...
+ *   Contact          ->  CTX_CONTACT_001, CTX_CONTACT_002, ...
+ *   A Policy page loads only CTX_POLICY_* files, a Contact page only
+ *   CTX_CONTACT_* files.
+ *
+ * SOQL COST
+ *   ONE query for all the files of an object, however many files there are.
+ *   The comparison with the record happens in the LWC, not here.
  */
 public with sharing class ContextualBannerHelper {
 
-    // ---------------------------------------------------------------- config
+    /** One rule = one file. What the LWC receives. */
+    public class Rule {
+        @AuraEnabled public String name;                 // static resource name - set here, not in the file
+        @AuraEnabled public String message;
+        @AuraEnabled public String description;
+        @AuraEnabled public List<String> policyRecords;
+    }
 
-    /** Static resources whose name starts with this are policy config files. */
-    public static final String POLICY_PREFIX = 'CTX_POLICY_';
-
-    /** Static resources whose name starts with this are contact config files. */
+    /** The name prefix decides which object a config file belongs to. */
+    public static final String POLICY_PREFIX  = 'CTX_POLICY_';
     public static final String CONTACT_PREFIX = 'CTX_CONTACT_';
 
-    // ------------------------------------------------------------ data shapes
+    /** A file listing more records than this is rejected and logged. */
+    @TestVisible
+    private static Integer maxRecordsPerFile = 50000;
 
-    /**
-     * One rule, as it appears in a config file.
-     * Exactly three properties, by design.
-     */
-    public class Rule {
-        public List<String> policyRecords;   // the records this rule applies to
-        public String message;               // what is shown in the banner
-        public String description;           // why the rule exists (not displayed)
+    /** Rules for PolicyMaster__c pages - reads ONLY the CTX_POLICY_* files. */
+    public static List<Rule> getPolicyRules() {
+        return loadRules(POLICY_PREFIX);
     }
 
-    /** What the LWC receives back. */
-    public class BannerMessage {
-        @AuraEnabled public String message     { get; set; }
-        @AuraEnabled public String description { get; set; }
-
-        public BannerMessage(String message, String description) {
-            this.message = message;
-            this.description = description;
-        }
+    /** Rules for Contact pages - reads ONLY the CTX_CONTACT_* files. */
+    public static List<Rule> getContactRules() {
+        return loadRules(CONTACT_PREFIX);
     }
 
-    // --------------------------------------------------------- read the config
-
     /**
-     * Loads every rule from every config file matching the prefix.
-     * ONE SOQL query, however many files there are.
-     *
-     * A malformed file is skipped and logged - it can never blank the banner.
+     * Loads every rule whose static resource name starts with the prefix.
+     * ONE SOQL query. A bad file is skipped and logged, never fatal.
      */
     public static List<Rule> loadRules(String prefix) {
 
-        List<Rule> allRules = new List<Rule>();
-
-        if (String.isBlank(prefix)) { return allRules; }
+        List<Rule> rules = new List<Rule>();
+        if (String.isBlank(prefix)) { return rules; }
 
         String pattern = prefix + '%';
 
-        // ONE query for all config files
         List<StaticResource> files = [
             SELECT Name, Body
             FROM StaticResource
@@ -77,63 +70,66 @@ public with sharing class ContextualBannerHelper {
         ];
 
         for (StaticResource file : files) {
-            try {
-                if (file.Body == null) { continue; }
+            // in LIKE an underscore matches any single character, so confirm
+            // the name really starts with the prefix
+            if (!file.Name.startsWithIgnoreCase(prefix)) { continue; }
 
-                String raw = file.Body.toString();
-                if (String.isBlank(raw)) { continue; }
-
-                List<Rule> fileRules = (List<Rule>) JSON.deserialize(raw, List<Rule>.class);
-
-                if (fileRules != null) {
-                    allRules.addAll(fileRules);
-                }
-            } catch (Exception e) {
-                // one bad file must not stop the others
-                System.debug(LoggingLevel.ERROR,
-                    'ContextualBanner - could not parse ' + file.Name + ': ' + e.getMessage());
-            }
+            String raw = (file.Body == null) ? null : file.Body.toString();
+            Rule r = parseRule(file.Name, raw);
+            if (r != null) { rules.add(r); }
         }
 
-        System.debug('ContextualBanner - loaded ' + allRules.size()
-            + ' rules from ' + files.size() + ' file(s) matching ' + pattern);
+        System.debug('ContextualBanner - ' + rules.size() + ' valid rule(s) from '
+            + files.size() + ' file(s) matching ' + pattern);
 
-        return allRules;
+        return rules;
     }
 
-    // ------------------------------------------------------------- evaluation
-
     /**
-     * Returns every message whose rule lists the given record value.
-     * Comparison is case-insensitive and trims whitespace, matching how
-     * SOQL behaved in the previous solution.
+     * Turns the text of one file into a Rule, or returns null (and logs why)
+     * if the file cannot be used.
      */
-    public static List<BannerMessage> match(List<Rule> rules, String recordValue) {
+    public static Rule parseRule(String fileName, String raw) {
 
-        List<BannerMessage> matched = new List<BannerMessage>();
-
-        if (rules == null || rules.isEmpty() || String.isBlank(recordValue)) {
-            return matched;
+        if (String.isBlank(raw)) {
+            logSkip(fileName, 'the file is empty');
+            return null;
         }
 
-        String target = recordValue.trim().toUpperCase();
+        // an editor may add a byte order mark, which breaks JSON.deserialize
+        String bom = String.fromCharArray(new List<Integer>{ 65279 });
+        String text = raw;
+        if (text.startsWith(bom)) { text = text.substring(1); }
 
-        for (Rule r : rules) {
-            if (r == null || r.policyRecords == null || r.policyRecords.isEmpty()) {
-                continue;
-            }
-
-            for (String value : r.policyRecords) {
-                if (value != null && value.trim().toUpperCase() == target) {
-                    matched.add(new BannerMessage(r.message, r.description));
-                    break;              // this rule matched - move to the next rule
-                }
-            }
+        Rule r;
+        try {
+            r = (Rule) JSON.deserialize(text, Rule.class);
+        } catch (Exception e) {
+            // also catches the old format, where a file held an array of rules
+            logSkip(fileName, 'not valid JSON for a single rule - ' + e.getMessage());
+            return null;
         }
 
-        System.debug('ContextualBanner - matched ' + matched.size()
-            + ' rule(s) for value "' + recordValue + '"');
+        if (r == null || String.isBlank(r.message)) {
+            logSkip(fileName, '"message" is missing or blank');
+            return null;
+        }
+        if (r.policyRecords == null || r.policyRecords.isEmpty()) {
+            logSkip(fileName, '"policyRecords" is missing or empty');
+            return null;
+        }
+        if (r.policyRecords.size() > maxRecordsPerFile) {
+            logSkip(fileName, 'it lists ' + r.policyRecords.size()
+                + ' records, the limit is ' + maxRecordsPerFile);
+            return null;
+        }
 
-        return matched;
+        r.name = fileName;
+        return r;
+    }
+
+    private static void logSkip(String fileName, String reason) {
+        System.debug(LoggingLevel.ERROR,
+            'ContextualBanner - skipped ' + fileName + ': ' + reason);
     }
 }
