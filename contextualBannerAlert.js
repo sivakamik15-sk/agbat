@@ -1,86 +1,94 @@
 import { LightningElement, api, wire } from 'lwc';
-
-import getPolicyMessages from '@salesforce/apex/ContextualBannerController.getPolicyMessages';
-import getContactMessages from '@salesforce/apex/ContextualBannerController.getContactMessages';
+import { getRecord } from 'lightning/uiRecordApi';
+import getRules from '@salesforce/apex/ContextualBannerController.getRules';
 
 /**
  * contextualBannerAlert
  *
- * Displays configured banner messages on a record page.
+ * Apex returns every rule for the object this page is on - one rule per
+ * static resource file, each with its message and its list of records.
+ * The comparison with the record being viewed happens here.
  *
- * The configuration lives in static resources named CTX_POLICY_001,
- * CTX_POLICY_002 and so on. Apex reads them all in a single query and
- * returns only the messages that apply to this record.
- *
- * NOTE ON IMPORTS
- *   There are exactly two imports above, and they never change. Adding a
- *   hundred more config files requires no change to this file, because the
- *   files are found by name prefix in Apex rather than imported here.
+ * Which value identifies the record, per object:
+ *   PolicyMaster__c -> the PolicyNumber__c field
+ *   Contact         -> the record Id
  */
+const MATCH_FIELD = {
+    PolicyMaster__c: 'PolicyNumber__c',
+    Contact: 'Id'
+};
+
+const BANNER_CLASS =
+    'slds-notify slds-notify_alert slds-theme_alert-texture slds-theme_warning';
+
 export default class ContextualBannerAlert extends LightningElement {
     @api recordId;
     @api objectApiName;
 
-    messages = [];
-    loaded = false;
+    ruleObject;      // object to load rules for - stays undefined if unsupported
+    recordFields;    // fields to read from the record - undefined when not needed
+    matchField;
+    rules;           // every rule for this object, from Apex
+    fieldValue;      // this record's value read through Lightning Data Service
 
-    // -------------------------------------------------- PolicyMaster__c pages
+    connectedCallback() {
+        const field = MATCH_FIELD[this.objectApiName];
+        if (!field) { return; }               // unsupported object - show nothing
 
-    @wire(getPolicyMessages, { recordId: '$policyRecordId' })
-    wiredPolicy({ data, error }) {
+        this.matchField = field;
+        this.ruleObject = this.objectApiName;
+        // a Contact is identified by its Id, which is already known
+        this.recordFields = field === 'Id' ? undefined : [this.objectApiName + '.' + field];
+    }
+
+    // One call returns the rules of every file for this object. The call takes
+    // no record Id, so the browser can reuse the result for every record.
+    @wire(getRules, { objectApiName: '$ruleObject' })
+    wiredRules({ data, error }) {
         if (data) {
-            this.apply(data, 'policy');
+            this.rules = data;
         } else if (error) {
-            this.report(error, 'policy');
+            this.logError(error, 'loading the rules');
         }
     }
 
-    // ------------------------------------------------------- Contact pages
-
-    @wire(getContactMessages, { recordId: '$contactRecordId' })
-    wiredContact({ data, error }) {
+    // Lightning Data Service - the record is already loaded for the page
+    @wire(getRecord, { recordId: '$recordId', fields: '$recordFields' })
+    wiredRecord({ data, error }) {
         if (data) {
-            this.apply(data, 'contact');
+            const f = data.fields[this.matchField];
+            this.fieldValue = f ? f.value : undefined;
         } else if (error) {
-            this.report(error, 'contact');
+            this.logError(error, 'reading the record');
         }
     }
 
-    /**
-     * Only one of the two wires is given a record Id, so only one calls Apex.
-     * The other stays undefined and never fires.
-     */
-    get policyRecordId() {
-        return this.objectApiName === 'PolicyMaster__c' ? this.recordId : undefined;
+    get currentValue() {
+        return this.matchField === 'Id' ? this.recordId : this.fieldValue;
     }
 
-    get contactRecordId() {
-        return this.objectApiName === 'Contact' ? this.recordId : undefined;
+    /** The banners to show: every rule whose list contains this record. */
+    get banners() {
+        const value = this.currentValue;
+        if (!this.rules || value === undefined || value === null || value === '') {
+            return [];
+        }
+
+        const target = String(value).trim().toUpperCase();
+
+        return this.rules
+            .filter(rule => Array.isArray(rule.policyRecords)
+                && rule.policyRecords.some(v => String(v).trim().toUpperCase() === target))
+            .map(rule => ({
+                key: rule.name,
+                message: rule.message,
+                cssClass: BANNER_CLASS
+            }));
     }
 
-    // ------------------------------------------------------------- rendering
-
-    apply(data, source) {
-        this.messages = (data || []).map((m, i) => ({
-            key: source + '-' + i,
-            message: m.message,
-            description: m.description,
-            cssClass: 'slds-notify slds-notify_alert slds-theme_alert-texture slds-theme_warning'
-        }));
-        this.loaded = true;
-
-        console.log('Contextual banner - ' + source + ': '
-            + this.messages.length + ' message(s) returned');
-    }
-
-    report(error, source) {
-        // a failure must never blank the page - just log and show nothing
-        this.loaded = true;
-        console.error('Contextual banner - ' + source + ' call failed:',
+    logError(error, doing) {
+        // a failure must never break the page - log the real message, show nothing
+        console.error('Contextual banner - problem ' + doing + ':',
             (error && error.body && error.body.message) ? error.body.message : error);
-    }
-
-    get hasMessages() {
-        return this.messages.length > 0;
     }
 }
