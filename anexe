@@ -1,0 +1,7 @@
+Integer before = Limits.getQueries();
+
+List<ContextualBannerHelper.Rule> rules =
+    ContextualBannerController.getRules('PolicyMaster__c');
+
+System.debug('### rules returned: ' + rules.size());
+System.debug('### queries used: ' + (Limits.getQueries() - before));
