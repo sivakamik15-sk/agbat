@@ -1,0 +1,15 @@
+Integer n = 100000;
+List<String> parts = new List<String>();
+for (Integer i = 0; i < n; i++) { parts.add('"LS' + String.valueOf(100000000 + i) + '"'); }
+String raw = '{"message":"perf test","description":"d","policyRecords":[' + String.join(parts, ',') + ']}';
+parts = null;
+
+Integer heap0 = Limits.getHeapSize();
+Integer cpu0  = Limits.getCpuTime();
+ContextualBannerHelper.Rule r =
+    (ContextualBannerHelper.Rule) JSON.deserialize(raw, ContextualBannerHelper.Rule.class);
+
+System.debug('### records parsed: ' + r.policyRecords.size());
+System.debug('### JSON size (chars): ' + raw.length());
+System.debug('### heap before / after parse: ' + heap0 + ' / ' + Limits.getHeapSize());
+System.debug('### parse CPU ms: ' + (Limits.getCpuTime() - cpu0));
