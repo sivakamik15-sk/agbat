@@ -1,0 +1,181 @@
+/**
+ * Tests for the banner classes.
+ *
+ * Static resources cannot be created from Apex, so the parsing and the
+ * memory logic are tested with sample text and numbers, and the query counts
+ * are tested against whatever config files exist in the org.
+ */
+@isTest
+private class ContextualBannerControllerTest {
+
+    private static final String VALID =
+        '{"message":"Banner text","description":"Why","policyRecords":["LS001","LS002"]}';
+
+    // -------------------------------------------- policy and contact separate
+
+    @isTest
+    static void policyAndContactUseTheirOwnPrefix() {
+        System.assertEquals('CTX_POLICY_',  ContextualBannerHelper.POLICY_PREFIX);
+        System.assertEquals('CTX_CONTACT_', ContextualBannerHelper.CONTACT_PREFIX);
+    }
+
+    @isTest
+    static void eachObjectIsLoadedSeparately() {
+        Test.startTest();
+        List<ContextualBannerHelper.Rule> policy = ContextualBannerHelper.getPolicyRules();
+        Integer afterPolicy = Limits.getQueries();
+        List<ContextualBannerHelper.Rule> contact = ContextualBannerHelper.getContactRules();
+        Integer afterContact = Limits.getQueries();
+        Test.stopTest();
+
+        System.assertNotEquals(null, policy);
+        System.assertNotEquals(null, contact);
+        System.assert(afterPolicy >= 1, 'policy rules run their own queries');
+        System.assert(afterContact > afterPolicy, 'contact rules run their own, separate queries');
+    }
+
+    // -------------------------------------------------------------- parsing
+
+    @isTest
+    static void validFileBecomesARule() {
+        ContextualBannerHelper.Rule r = ContextualBannerHelper.parseRule('CTX_POLICY_001', VALID);
+
+        System.assertNotEquals(null, r, 'a valid file must produce a rule');
+        System.assertEquals('CTX_POLICY_001', r.name);
+        System.assertEquals('Banner text', r.message);
+        System.assertEquals('Why', r.description);
+        System.assertEquals(2, r.policyRecords.size());
+    }
+
+    @isTest
+    static void byteOrderMarkIsTolerated() {
+        String bom = String.fromCharArray(new List<Integer>{ 65279 });
+
+        System.assertNotEquals(null,
+            ContextualBannerHelper.parseRule('CTX_POLICY_001', bom + VALID),
+            'a leading byte order mark must not break parsing');
+    }
+
+    @isTest
+    static void oldArrayFormatIsRejected() {
+        String oldFormat = '[' + VALID + ']';
+
+        System.assertEquals(null,
+            ContextualBannerHelper.parseRule('CTX_POLICY_001', oldFormat),
+            'one rule per file - an array of rules is not accepted');
+    }
+
+    @isTest
+    static void incompleteFilesAreRejected() {
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F', null));
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F', ''));
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F', 'not json'));
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"description":"d","policyRecords":["A"]}'), 'message is required');
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"message":"m","description":"d","policyRecords":[]}'), 'records are required');
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"message":"m","description":"d"}'), 'records are required');
+    }
+
+    @isTest
+    static void descriptionIsOptional() {
+        System.assertNotEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"message":"m","policyRecords":["A"]}'));
+    }
+
+    // ------------------------------------------------- query count and loading
+
+    @isTest
+    static void noMatchingFilesCostsOneQuery() {
+        Test.startTest();
+        List<ContextualBannerHelper.Rule> rules = ContextualBannerHelper.loadRules('CTX_NO_SUCH_PREFIX_');
+        Integer used = Limits.getQueries();
+        Test.stopTest();
+
+        System.assertEquals(0, rules.size());
+        System.assertEquals(1, used, 'only the file list is queried when there is nothing to load');
+    }
+
+    @isTest
+    static void blankPrefixLoadsNothingAndCostsNothing() {
+        Test.startTest();
+        List<ContextualBannerHelper.Rule> rules = ContextualBannerHelper.loadRules(null);
+        Integer used = Limits.getQueries();
+        Test.stopTest();
+
+        System.assertEquals(0, rules.size());
+        System.assertEquals(0, used, 'nothing to look up, so no query');
+    }
+
+    // --------------------------------------------- memory: nothing hard-coded
+
+    @isTest
+    static void fitsFollowsTheOrgsOwnHeapLimit() {
+        // the same load that does not fit a small limit fits a bigger one
+        System.assertEquals(false, ContextualBannerHelper.fits(5000000, 6000000, 200000),
+            'close to a 6 MB limit, a further 200 KB of files must not be started');
+        System.assertEquals(true, ContextualBannerHelper.fits(5000000, 12000000, 200000),
+            'the same load fits comfortably under a 12 MB limit');
+    }
+
+    @isTest
+    static void fitsAllowsEverythingWhileThereIsRoom() {
+        System.assertEquals(true, ContextualBannerHelper.fits(0, 6000000, 100000),
+            'an empty heap must accept a normal group of files');
+        System.assertEquals(true, ContextualBannerHelper.fits(100000, 6000000, 0),
+            'a group of no size always fits');
+    }
+
+    @isTest
+    static void filesAreGroupedBySize() {
+        List<ContextualBannerHelper.Batch> batches = ContextualBannerHelper.planBatches(
+            new List<String>{ 'a', 'b', 'c', 'd' },
+            new List<Integer>{ 40, 40, 40, 40 },
+            100);
+
+        System.assertEquals(2, batches.size(), 'two files of 40 fit in 100, a third does not');
+        System.assertEquals(2, batches[0].names.size());
+        System.assertEquals(80, batches[0].bytes);
+        System.assertEquals('c', batches[1].names[0], 'files stay in order');
+    }
+
+    @isTest
+    static void aBigFileGetsAGroupOfItsOwn() {
+        List<ContextualBannerHelper.Batch> batches = ContextualBannerHelper.planBatches(
+            new List<String>{ 'a', 'big', 'c' },
+            new List<Integer>{ 10, 500, 10 },
+            100);
+
+        System.assertEquals(3, batches.size(), 'a file over the group size is never combined');
+        System.assertEquals('big', batches[1].names[0]);
+    }
+
+    @isTest
+    static void noFilesPlansNoGroups() {
+        System.assertEquals(0, ContextualBannerHelper.planBatches(
+            new List<String>(), new List<Integer>(), 100).size());
+    }
+
+    // ------------------------------------------------------------ controller
+
+    @isTest
+    static void controllerRoutesByObject() {
+        Test.startTest();
+
+        // an unsupported object has no config files and costs no query
+        System.assertEquals(0, ContextualBannerController.getRules('Account').size());
+        System.assertEquals(0, ContextualBannerController.getRules(null).size());
+        System.assertEquals(0, Limits.getQueries(), 'unsupported objects must not query');
+
+        // each supported object runs its own queries, for its own files only
+        System.assertNotEquals(null, ContextualBannerController.getRules('PolicyMaster__c'));
+        Integer afterPolicy = Limits.getQueries();
+        System.assert(afterPolicy >= 1, 'a Policy page runs its own queries');
+
+        System.assertNotEquals(null, ContextualBannerController.getRules('Contact'));
+        System.assert(Limits.getQueries() > afterPolicy, 'a Contact page runs its own, separate queries');
+
+        Test.stopTest();
+    }
+}
