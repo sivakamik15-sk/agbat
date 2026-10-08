@@ -37,10 +37,6 @@ public with sharing class ContextualBannerHelper {
     public static final String POLICY_PREFIX  = 'CTX_POLICY_';
     public static final String CONTACT_PREFIX = 'CTX_CONTACT_';
 
-    /** A file listing more records than this is rejected and logged. */
-    @TestVisible
-    private static Integer maxRecordsPerFile = 50000;
-
     /** Rules for PolicyMaster__c pages - reads ONLY the CTX_POLICY_* files. */
     public static List<Rule> getPolicyRules() {
         return loadRules(POLICY_PREFIX);
@@ -116,11 +112,6 @@ public with sharing class ContextualBannerHelper {
         }
         if (r.policyRecords == null || r.policyRecords.isEmpty()) {
             logSkip(fileName, '"policyRecords" is missing or empty');
-            return null;
-        }
-        if (r.policyRecords.size() > maxRecordsPerFile) {
-            logSkip(fileName, 'it lists ' + r.policyRecords.size()
-                + ' records, the limit is ' + maxRecordsPerFile);
             return null;
         }
 
