@@ -1,0 +1,133 @@
+/**
+ * Tests for the banner classes.
+ *
+ * Static resources cannot be created from Apex, so the parsing rules are
+ * tested through parseRule() with sample text, and the query counts are tested
+ * against whatever config files exist in the org.
+ */
+@isTest
+private class ContextualBannerControllerTest {
+
+    private static final String VALID =
+        '{"message":"Banner text","description":"Why","policyRecords":["LS001","LS002"]}';
+
+    // -------------------------------------------- policy and contact separate
+
+    @isTest
+    static void policyAndContactUseTheirOwnPrefix() {
+        System.assertEquals('CTX_POLICY_',  ContextualBannerHelper.POLICY_PREFIX);
+        System.assertEquals('CTX_CONTACT_', ContextualBannerHelper.CONTACT_PREFIX);
+    }
+
+    @isTest
+    static void eachObjectIsLoadedWithItsOwnQuery() {
+        Test.startTest();
+        List<ContextualBannerHelper.Rule> policy = ContextualBannerHelper.getPolicyRules();
+        Integer afterPolicy = Limits.getQueries();
+        List<ContextualBannerHelper.Rule> contact = ContextualBannerHelper.getContactRules();
+        Integer afterContact = Limits.getQueries();
+        Test.stopTest();
+
+        System.assertNotEquals(null, policy);
+        System.assertNotEquals(null, contact);
+        System.assertEquals(1, afterPolicy,  'policy rules cost exactly one query');
+        System.assertEquals(2, afterContact, 'contact rules cost one more - each object has its own query');
+    }
+
+    // -------------------------------------------------------------- parsing
+
+    @isTest
+    static void validFileBecomesARule() {
+        ContextualBannerHelper.Rule r = ContextualBannerHelper.parseRule('CTX_POLICY_001', VALID);
+
+        System.assertNotEquals(null, r, 'a valid file must produce a rule');
+        System.assertEquals('CTX_POLICY_001', r.name);
+        System.assertEquals('Banner text', r.message);
+        System.assertEquals('Why', r.description);
+        System.assertEquals(2, r.policyRecords.size());
+    }
+
+    @isTest
+    static void byteOrderMarkIsTolerated() {
+        String bom = String.fromCharArray(new List<Integer>{ 65279 });
+
+        System.assertNotEquals(null,
+            ContextualBannerHelper.parseRule('CTX_POLICY_001', bom + VALID),
+            'a leading byte order mark must not break parsing');
+    }
+
+    @isTest
+    static void oldArrayFormatIsRejected() {
+        String oldFormat = '[' + VALID + ']';
+
+        System.assertEquals(null,
+            ContextualBannerHelper.parseRule('CTX_POLICY_001', oldFormat),
+            'one rule per file - an array of rules is not accepted');
+    }
+
+    @isTest
+    static void incompleteFilesAreRejected() {
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F', null));
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F', ''));
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F', 'not json'));
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"description":"d","policyRecords":["A"]}'), 'message is required');
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"message":"m","description":"d","policyRecords":[]}'), 'records are required');
+        System.assertEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"message":"m","description":"d"}'), 'records are required');
+    }
+
+    @isTest
+    static void descriptionIsOptional() {
+        System.assertNotEquals(null, ContextualBannerHelper.parseRule('F',
+            '{"message":"m","policyRecords":["A"]}'));
+    }
+
+    // ----------------------------------------------------------- query count
+
+    @isTest
+    static void loadingAllFilesOfAnObjectCostsOneQuery() {
+        Test.startTest();
+        List<ContextualBannerHelper.Rule> rules =
+            ContextualBannerHelper.loadRules(ContextualBannerHelper.POLICY_PREFIX);
+        Integer used = Limits.getQueries();
+        Test.stopTest();
+
+        System.assertNotEquals(null, rules);
+        System.assertEquals(1, used,
+            'all files of an object must be read with exactly one query, used: ' + used);
+    }
+
+    @isTest
+    static void blankPrefixLoadsNothingAndCostsNothing() {
+        Test.startTest();
+        List<ContextualBannerHelper.Rule> rules = ContextualBannerHelper.loadRules(null);
+        Integer used = Limits.getQueries();
+        Test.stopTest();
+
+        System.assertEquals(0, rules.size());
+        System.assertEquals(0, used, 'nothing to look up, so no query');
+    }
+
+    // ------------------------------------------------------------ controller
+
+    @isTest
+    static void controllerRoutesByObject() {
+        Test.startTest();
+
+        // an unsupported object has no config files and costs no query
+        System.assertEquals(0, ContextualBannerController.getRules('Account').size());
+        System.assertEquals(0, ContextualBannerController.getRules(null).size());
+        System.assertEquals(0, Limits.getQueries(), 'unsupported objects must not query');
+
+        // each supported object runs exactly one query, for its own files only
+        System.assertNotEquals(null, ContextualBannerController.getRules('PolicyMaster__c'));
+        System.assertEquals(1, Limits.getQueries(), 'a Policy page costs one query');
+
+        System.assertNotEquals(null, ContextualBannerController.getRules('Contact'));
+        System.assertEquals(2, Limits.getQueries(), 'a Contact page costs one more');
+
+        Test.stopTest();
+    }
+}
