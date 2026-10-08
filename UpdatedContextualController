@@ -1,0 +1,43 @@
+/**
+ * ContextualBannerController
+ *
+ * The only class the LWC calls. One entry point that sends the request to the
+ * right method by object:
+ *
+ *   PolicyMaster__c page -> ContextualBannerHelper.getPolicyRules()   CTX_POLICY_* files
+ *   Contact page         -> ContextualBannerHelper.getContactRules()  CTX_CONTACT_* files
+ *
+ * Each of those reads only its own files, so nothing is loaded and then
+ * filtered. The rules come back with their lists of records; the LWC does the
+ * comparison with the record being viewed.
+ *
+ * The method takes no record Id, so the result is the same for every record of
+ * an object and the browser can cache it.
+ *
+ * A failure returns an empty list rather than an error, so the page is never
+ * broken by the banner.
+ */
+public with sharing class ContextualBannerController {
+
+    @AuraEnabled(cacheable=true)
+    public static List<ContextualBannerHelper.Rule> getRules(String objectApiName) {
+
+        List<ContextualBannerHelper.Rule> empty = new List<ContextualBannerHelper.Rule>();
+
+        try {
+            if (objectApiName == 'PolicyMaster__c') {
+                return ContextualBannerHelper.getPolicyRules();
+            }
+            if (objectApiName == 'Contact') {
+                return ContextualBannerHelper.getContactRules();
+            }
+            return empty;                       // any other object has no config files
+
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR,
+                'ContextualBanner - getRules failed for ' + objectApiName
+                + ': ' + e.getMessage());
+            return empty;
+        }
+    }
+}
