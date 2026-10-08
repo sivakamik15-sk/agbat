@@ -3,7 +3,7 @@
  *
  * Reads the banner rules from static resources.
  *
- * ONE RULE PER FILE
+ *  ONE RULE PER FILE
  *   Every static resource holds exactly one rule, so a mistake in one file
  *   can never affect another rule.
  *
