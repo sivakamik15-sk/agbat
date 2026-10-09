@@ -32,10 +32,11 @@ $TwoBannerPolicies   = 10         # this many policies are put in 2 files -> the
 $UnlistedReserve     = 5          # this many policies are kept OUT of every file -> must show nothing
 
 # Which message each file gets:
+#   fill      = files use your content sheet rows one by one; when the rows run out, the rest get a generated test message
 #   alternate = odd files use a message from your content sheet, even files a generated test message
 #   all       = every file uses your content sheet (cycled)
 #   none      = every file uses a generated test message
-$ContentMode = 'alternate'
+$ContentMode = 'fill'
 
 # ----------------------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
@@ -163,7 +164,7 @@ $msgCursor = 0
 for ($i = 0; $i -lt $FileCount; $i++) {
     $num  = $FirstFileNumber + $i
     $name = $Prefix + $num
-    $useSheet = switch ($ContentMode) { 'all' { $true } 'none' { $false } default { ($i % 2) -eq 0 } }
+    $useSheet = switch ($ContentMode) { 'all' { $true } 'none' { $false } 'fill' { $i -lt $messages.Count } default { ($i % 2) -eq 0 } }
     if ($useSheet) {
         $row = $msgCursor % $messages.Count
         $msg = $messages[$row]
