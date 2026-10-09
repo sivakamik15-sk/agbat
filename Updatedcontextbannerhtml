@@ -1,0 +1,10 @@
+<template>
+    <template for:each={banners} for:item="b">
+        <div key={b.key} class={b.cssClass} role="alert"
+             style="text-align:left; justify-content:left;">
+            <lightning-icon icon-name="utility:warning" variant="warning"
+                            size="small" style="margin-right:2%;"></lightning-icon>
+            <lightning-formatted-rich-text value={b.message}></lightning-formatted-rich-text>
+        </div>
+    </template>
+</template>
