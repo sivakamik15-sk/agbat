@@ -1,0 +1,141 @@
+import { LightningElement, api, wire } from 'lwc';
+import { getRecord } from 'lightning/uiRecordApi';
+import getRules from '@salesforce/apex/ContextualBannerController.getRules';
+import getContactPolicyNumbers from '@salesforce/apex/ContextualBannerController.getContactPolicyNumbers';
+
+/**
+ * contextualBannerAlert
+ *
+ * Apex returns every rule for the object this page is on - one rule per
+ * static resource file, each with its message and its list of records.
+ * The comparison with the record being viewed happens here.
+ *
+ * Which value identifies the record, per object:
+ *   PolicyMaster__c -> the PolicyNumber__c field
+ *   Contact         -> the record Id
+ *
+ * A Contact page also shows the banners of the policies linked to the contact,
+ * so it needs the policy rules and the contact's policy numbers as well.
+ */
+const MATCH_FIELD = {
+    PolicyMaster__c: 'PolicyNumber__c',
+    Contact: 'Id'
+};
+
+const BANNER_CLASS =
+    'slds-notify slds-notify_alert slds-theme_alert-texture slds-theme_warning';
+
+export default class ContextualBannerAlert extends LightningElement {
+    @api recordId;
+    @api objectApiName;
+
+    ruleObject;      // object to load rules for - stays undefined if unsupported
+    recordFields;    // fields to read from the record - undefined when not needed
+    matchField;
+    rules;           // every rule for this object, from Apex
+    policyRuleObject;     // Contact page only: also load the policy rules
+    policyRules;          // Contact page only: the policy rules
+    contactPolicyNumbers; // Contact page only: policies linked to this contact
+    contactId;            // Contact page only: the contact whose policies to read
+    fieldValue;      // this record's value read through Lightning Data Service
+
+    connectedCallback() {
+        const field = MATCH_FIELD[this.objectApiName];
+        if (!field) { return; }               // unsupported object - show nothing
+
+        this.matchField = field;
+        this.ruleObject = this.objectApiName;
+        if (this.objectApiName === 'Contact') {
+            this.policyRuleObject = 'PolicyMaster__c';
+            this.contactId = this.recordId;
+        }
+        // a Contact is identified by its Id, which is already known
+        this.recordFields = field === 'Id' ? undefined : [this.objectApiName + '.' + field];
+    }
+
+    // One call returns the rules of every file for this object. The call takes
+    // no record Id, so the browser can reuse the result for every record.
+    @wire(getRules, { objectApiName: '$ruleObject' })
+    wiredRules({ data, error }) {
+        if (data) {
+            this.rules = data;
+        } else if (error) {
+            this.logError(error, 'loading the rules');
+        }
+    }
+
+    // Contact page only: the policy rules, the same files the Policy page uses
+    @wire(getRules, { objectApiName: '$policyRuleObject' })
+    wiredPolicyRules({ data, error }) {
+        if (data) {
+            this.policyRules = data;
+        } else if (error) {
+            this.logError(error, 'loading the policy rules');
+        }
+    }
+
+    // Contact page only: the policy numbers linked to this contact
+    @wire(getContactPolicyNumbers, { contactId: '$contactId' })
+    wiredContactPolicies({ data, error }) {
+        if (data) {
+            this.contactPolicyNumbers = data;
+        } else if (error) {
+            this.logError(error, 'reading the contact policies');
+        }
+    }
+
+    // Lightning Data Service - the record is already loaded for the page
+    @wire(getRecord, { recordId: '$recordId', fields: '$recordFields' })
+    wiredRecord({ data, error }) {
+        if (data) {
+            const f = data.fields[this.matchField];
+            this.fieldValue = f ? f.value : undefined;
+        } else if (error) {
+            this.logError(error, 'reading the record');
+        }
+    }
+
+    get currentValue() {
+        return this.matchField === 'Id' ? this.recordId : this.fieldValue;
+    }
+
+    /** The banners to show: every rule whose list contains this record. */
+    get banners() {
+        const matched = [];
+        const value = this.currentValue;
+
+        if (this.rules && value !== undefined && value !== null && value !== '') {
+            this.addMatches(matched, this.rules, [value]);
+        }
+
+        // Contact page: also the banners of the policies linked to the contact
+        if (this.policyRules && this.contactPolicyNumbers) {
+            this.addMatches(matched, this.policyRules, this.contactPolicyNumbers);
+        }
+
+        return matched.map(rule => ({
+            key: rule.name,
+            message: rule.message,
+            cssClass: BANNER_CLASS
+        }));
+    }
+
+    // Adds each rule whose list contains any of the values - once per rule, so a
+    // contact with several policies in the same rule shows that banner once.
+    addMatches(matched, rules, values) {
+        const targets = new Set(values.map(v => String(v).trim().toUpperCase()));
+        rules.forEach(rule => {
+            if (matched.some(m => m.name === rule.name)) { return; }
+            if (Array.isArray(rule.policyRecords)
+                && rule.policyRecords.some(v => targets.has(String(v).trim().toUpperCase()))) {
+                matched.push(rule);
+            }
+        });
+    }
+
+    logError(error, doing) {
+        // a failure must never break the page - log the real message, show nothing
+        console.error('Contextual banner - problem ' + doing + ':',
+            (error && error.body && error.body.message) ? error.body.message : error);
+    }
+}
