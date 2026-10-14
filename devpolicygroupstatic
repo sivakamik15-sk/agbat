@@ -1,0 +1,5 @@
+{
+  "message": "TEST - banner for the FFS Policies policy group",
+  "description": "TEST - demo of a policy group rule, replace with the real message",
+  "policyRecords": ["FFS Policies"]
+}
