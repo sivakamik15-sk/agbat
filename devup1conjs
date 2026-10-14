@@ -1,0 +1,125 @@
+import { LightningElement, api, wire } from 'lwc';
+import { getRecord } from 'lightning/uiRecordApi';
+import getRules from '@salesforce/apex/ContextualBannerController.getRules';
+
+/**
+ * contextualBannerAlert
+ *
+ * Apex returns every rule for the object this page is on - one rule per
+ * static resource file, each with its message and its list of values.
+ * The comparison with the record being viewed happens here.
+ *
+ * The NAME of a rule's file says which field of the record its list is
+ * compared with:
+ *   CTX_POLICYGROUP_*  -> the PolicyGroup__c field of the policy
+ *   CTX_POLICY_*       -> the PolicyNumber__c field of the policy
+ *   CTX_CONTACT_*      -> the record Id of the contact
+ * To support another category, add one line to RULE_FIELDS.
+ */
+const RULE_FIELDS = [
+    // the longer prefix first: CTX_POLICYGROUP_ also starts with CTX_POLICY
+    { prefix: 'CTX_POLICYGROUP_', field: 'PolicyGroup__c' },
+    { prefix: 'CTX_POLICY_',      field: 'PolicyNumber__c' },
+    { prefix: 'CTX_CONTACT_',     field: 'Id' }
+];
+
+// Fields to read per object. Required fields must be readable by the user.
+// Optional fields are skipped quietly when the user cannot read them, so one
+// unreadable field never hides the other banners.
+const OBJECT_FIELDS = {
+    PolicyMaster__c: { required: ['PolicyNumber__c'], optional: ['PolicyGroup__c'] },
+    Contact:         { required: [],                  optional: [] }
+};
+
+const BANNER_CLASS =
+    'slds-notify slds-notify_alert slds-theme_alert-texture slds-theme_warning';
+
+export default class ContextualBannerAlert extends LightningElement {
+    @api recordId;
+    @api objectApiName;
+
+    ruleObject;       // object to load rules for - stays undefined if unsupported
+    recordFields;     // fields that must be read - undefined when none are needed
+    optionalFields;   // fields read when the user may see them
+    rules;            // every rule for this object, from Apex
+    fieldValues = {}; // this record's values read through Lightning Data Service
+
+    connectedCallback() {
+        const config = OBJECT_FIELDS[this.objectApiName];
+        if (!config) { return; }              // unsupported object - show nothing
+
+        this.ruleObject = this.objectApiName;
+        const withObject = field => this.objectApiName + '.' + field;
+        this.recordFields = config.required.length ? config.required.map(withObject) : undefined;
+        this.optionalFields = config.optional.length ? config.optional.map(withObject) : undefined;
+    }
+
+    // One call returns the rules of every file for this object. The call takes
+    // no record Id, so the browser can reuse the result for every record.
+    @wire(getRules, { objectApiName: '$ruleObject' })
+    wiredRules({ data, error }) {
+        if (data) {
+            this.rules = data;
+        } else if (error) {
+            this.logError(error, 'loading the rules');
+        }
+    }
+
+    // Lightning Data Service - the record is already loaded for the page
+    @wire(getRecord, {
+        recordId: '$recordId',
+        fields: '$recordFields',
+        optionalFields: '$optionalFields'
+    })
+    wiredRecord({ data, error }) {
+        if (data) {
+            const values = {};
+            Object.keys(data.fields).forEach(name => {
+                values[name] = data.fields[name].value;
+            });
+            this.fieldValues = values;
+        } else if (error) {
+            this.logError(error, 'reading the record');
+        }
+    }
+
+    // The value of a field for this record. A contact is identified by its Id,
+    // which is already known.
+    valueOf(field) {
+        return field === 'Id' ? this.recordId : this.fieldValues[field];
+    }
+
+    // Which field a rule's list is compared with, from the file name
+    fieldFor(ruleName) {
+        const name = String(ruleName).toUpperCase();
+        const match = RULE_FIELDS.find(entry => name.startsWith(entry.prefix));
+        return match ? match.field : undefined;
+    }
+
+    /** The banners to show: every rule whose list contains this record's value. */
+    get banners() {
+        if (!this.rules) { return []; }
+
+        return this.rules
+            .filter(rule => {
+                const field = this.fieldFor(rule.name);
+                const value = field ? this.valueOf(field) : undefined;
+                if (value === undefined || value === null || value === '') { return false; }
+
+                const target = String(value).trim().toUpperCase();
+                return Array.isArray(rule.policyRecords)
+                    && rule.policyRecords.some(v => String(v).trim().toUpperCase() === target);
+            })
+            .map(rule => ({
+                key: rule.name,
+                message: rule.message,
+                cssClass: BANNER_CLASS
+            }));
+    }
+
+    logError(error, doing) {
+        // a failure must never break the page - log the real message, show nothing
+        console.error('Contextual banner - problem ' + doing + ':',
+            (error && error.body && error.body.message) ? error.body.message : error);
+    }
+}
