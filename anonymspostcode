@@ -1,0 +1,3 @@
+System.debug('CODES: ' + ContextualBannerController.getLinkedPostalCodes('a32030000002QMMAA2'));
+List<ContextualBannerHelper.Rule> r = ContextualBannerController.getRules('PolicyMaster__c');
+for (ContextualBannerHelper.Rule x : r) { System.debug('RULE: ' + x.name); }
