@@ -1,0 +1,5 @@
+{
+  "message": "TEST - banner for a policy whose contact postal code starts with 12345",
+  "description": "TEST - demo of a postal code rule, replace the code and message with the real ones",
+  "policyRecords": ["12345"]
+}
