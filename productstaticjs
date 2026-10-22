@@ -1,0 +1,5 @@
+{
+  "message": "TEST - banner for the TotalSecure and NL LifeBuilder products",
+  "description": "TEST - demo of a product name rule, replace with the real message",
+  "policyRecords": ["TotalSecure", "TotalSecure NL", "NL LifeBuilder"]
+}
