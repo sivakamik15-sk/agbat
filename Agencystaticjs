@@ -1,0 +1,6 @@
+{
+  "message": "TEST - banner for policies of agency 3NP, except the excluded policies",
+  "description": "TEST - demo of an agency number rule, replace with the real message",
+  "policyRecords": ["3NP"],
+  "excludeRecords": ["1229214X"]
+}
