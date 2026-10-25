@@ -1,0 +1,5 @@
+{
+  "message": "TEST - banner for policies with system code SE2",
+  "description": "TEST - demo of a system code rule, replace with the real message",
+  "policyRecords": ["SE2"]
+}
