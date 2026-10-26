@@ -1,0 +1,119 @@
+/**
+ * ContextualBannerController
+ *
+ * The only class the LWC calls. One entry point that sends the request to the
+ * right method by object:
+ *
+ *   PolicyMaster__c page -> ContextualBannerHelper.getPolicyRules()
+ *                           CTX_POLICY_* files (policy numbers),
+ *                           CTX_POLICYGROUP_* files (policy groups) and
+ *                           CTX_POSTCODE_* files (postal codes), one query
+ *   Contact page         -> ContextualBannerHelper.getContactRules()  CTX_CONTACT_* files
+ *                           (getLinkedPolicyGroups serves the CTX_CONTACT_POLICYGROUP_* files)
+ *
+ * Each of those reads only its own files, so nothing is loaded and then
+ * filtered. The rules come back with their lists of values; the LWC does the
+ * comparison with the record being viewed.
+ *
+ * The method takes no record Id, so the result is the same for every record of
+ * an object and the browser can cache it.
+ *
+ * A failure returns an empty list rather than an error, so the page is never
+ * broken by the banner.
+ */
+public with sharing class ContextualBannerController {
+
+    @AuraEnabled(cacheable=true)
+    public static List<ContextualBannerHelper.Rule> getRules(String objectApiName) {
+
+        List<ContextualBannerHelper.Rule> empty = new List<ContextualBannerHelper.Rule>();
+
+        try {
+            if (objectApiName == 'PolicyMaster__c') {
+                return ContextualBannerHelper.getPolicyRules();
+            }
+            if (objectApiName == 'Contact') {
+                return ContextualBannerHelper.getContactRules();
+            }
+            return empty;                       // any other object has no config files
+
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR,
+                'ContextualBanner - getRules failed for ' + objectApiName
+                + ': ' + e.getMessage());
+            return empty;
+        }
+    }
+
+    /** What the LWC receives about the contacts linked to a policy. */
+    public class LinkedContacts {
+        @AuraEnabled public List<String> postalCodes = new List<String>();
+        @AuraEnabled public List<String> names = new List<String>();
+    }
+
+    /**
+     * The postal codes and names of the contacts linked to a policy, for the
+     * CTX_POSTCODE_* and CTX_CONTACTNAME_* rules. ONE query for both, and the LWC
+     * only asks when such a rule exists. The result depends only on the policy,
+     * so the browser can cache it.
+     */
+    @AuraEnabled(cacheable=true)
+    public static LinkedContacts getLinkedContacts(Id policyId) {
+
+        LinkedContacts result = new LinkedContacts();
+        if (policyId == null) { return result; }
+
+        Set<String> codes = new Set<String>();
+        Set<String> names = new Set<String>();
+
+        try {
+            for (PolicyContact__c link : [
+                SELECT Contact__r.MailingPostalCode, Contact__r.Name
+                FROM PolicyContact__c
+                WHERE Policy__c = :policyId
+            ]) {
+                if (link.Contact__r == null) { continue; }
+                if (link.Contact__r.MailingPostalCode != null) { codes.add(link.Contact__r.MailingPostalCode); }
+                if (link.Contact__r.Name != null) { names.add(link.Contact__r.Name); }
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR,
+                'ContextualBanner - getLinkedContacts failed for ' + policyId
+                + ': ' + e.getMessage());
+        }
+
+        result.postalCodes = new List<String>(codes);
+        result.names = new List<String>(names);
+        return result;
+    }
+
+    /**
+     * The distinct policy groups of the policies linked to a contact, for the
+     * CTX_CONTACT_POLICYGROUP_* rules on the Contact page. ONE query. It groups
+     * in the query, so a contact linked to thousands of policies still returns
+     * only its few distinct groups. The LWC only asks when such a rule exists.
+     */
+    @AuraEnabled(cacheable=true)
+    public static List<String> getLinkedPolicyGroups(Id contactId) {
+
+        List<String> groups = new List<String>();
+        if (contactId == null) { return groups; }
+
+        try {
+            for (AggregateResult row : [
+                SELECT Policy__r.PolicyGroup__c grp
+                FROM PolicyContact__c
+                WHERE Contact__c = :contactId
+                AND Policy__r.PolicyGroup__c != null
+                GROUP BY Policy__r.PolicyGroup__c
+            ]) {
+                groups.add((String) row.get('grp'));
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR,
+                'ContextualBanner - getLinkedPolicyGroups failed for ' + contactId
+                + ': ' + e.getMessage());
+        }
+        return groups;
+    }
+}
