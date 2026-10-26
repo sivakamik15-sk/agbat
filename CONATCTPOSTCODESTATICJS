@@ -1,0 +1,7 @@
+{
+  "message": "TEST - banner for contacts whose mailing postal code starts with 97733",
+  "description": "TEST - demo of a contact mailing postal code rule, replace with the real message",
+  "policyRecords": [
+    "97733"
+  ]
+}
