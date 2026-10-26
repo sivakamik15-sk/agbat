@@ -1,0 +1,8 @@
+{
+  "message": "TEST - banner for contacts with global agent ID 223785 or 263992",
+  "description": "TEST - demo of a global agent ID rule, replace with the real message",
+  "policyRecords": [
+    "223785",
+    "263992"
+  ]
+}
