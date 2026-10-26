@@ -1,0 +1,7 @@
+{
+  "message": "TEST - banner for contacts with LSW life agent number 71885",
+  "description": "TEST - demo of an LSW life agent number rule, replace with the real message",
+  "policyRecords": [
+    "71885"
+  ]
+}
