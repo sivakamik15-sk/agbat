@@ -1,0 +1,7 @@
+{
+  "message": "TEST - banner for contacts of the account 0015a00002hazxlAAA",
+  "description": "TEST - demo of an account rule, replace with the real message and with account Ids of this org",
+  "policyRecords": [
+    "0015a00002hazxlAAA"
+  ]
+}
