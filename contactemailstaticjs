@@ -1,0 +1,7 @@
+{
+  "message": "TEST - the email address of this contact has bounced, please update it",
+  "description": "TEST - demo of an email bounced rule, replace with the real message. The list must hold true: the banner shows when the IsEmailBounced checkbox is checked.",
+  "policyRecords": [
+    "true"
+  ]
+}
