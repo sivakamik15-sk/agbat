@@ -1,0 +1,7 @@
+{
+  "message": "TEST - banner for the contact named CLARK COUNTY SCHOOL DISTRICT",
+  "description": "TEST - demo of a contact name rule on the Contact page, replace with the real message",
+  "policyRecords": [
+    "CLARK COUNTY SCHOOL DISTRICT"
+  ]
+}
