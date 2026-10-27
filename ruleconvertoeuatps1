@@ -1,0 +1,509 @@
+# convert-rules.ps1
+#
+# Turns the OLD rule criteria of the contextual banner into static resource files.
+# It asks for two files and NEVER deploys anything:
+#
+#     the POLICY rules file    the active rules whose RuleObject is PolicyMaster__c
+#     the CONTACT rules file   the active rules whose RuleObject is Contact
+#
+# Each file can be .csv (Excel: Save As "CSV UTF-8") or .xlsx (the first sheet is read;
+# Excel must be installed). Needed columns: the query, the message and, if you have them,
+# an active column, the rule Id and the RuleObject.
+#
+# Output (on the Desktop, the folder is created new every time):
+#     Static Resource UAT Rules\Policy Rules\    CTX_POLICY_<TYPE>_001.json (+ .resource-meta.xml)
+#     Static Resource UAT Rules\Contact Rules\   CTX_CONTACT_<TYPE>_001.json (+ .resource-meta.xml)
+#     Static Resource UAT Rules\RECONCILIATION.csv   every rule: values in the query vs values in the file
+#     Static Resource UAT Rules\NEEDS-REVIEW.csv     rules the script would not convert on its own
+#     Static Resource UAT Rules\SUMMARY.txt
+#
+# The message and every value (policy number, name, Id ...) are copied exactly as they are.
+# Nothing is guessed. A rule whose query is not one of the known shapes is NOT converted and
+# is listed in NEEDS-REVIEW.csv with the reason. After writing the files, the script re-reads
+# every file and compares it with the original query in a second, independent way.
+
+param(
+    [string]$PolicyFile  = '',
+    [string]$ContactFile = '',
+    [string]$OutputRoot  = [Environment]::GetFolderPath('Desktop'),
+    [string]$FolderName  = 'Static Resource UAT Rules'
+)
+
+$ErrorActionPreference = 'Stop'
+
+
+# ------------------------------------------------------------------ the known shapes
+# Type    = part of the file name      Field = regex of the field in the WHERE clause
+# Topic   = text for the description   Kind  = how the value is read
+$policyTypes = @(
+    @{ Type = 'POSTCODE';    Field = 'contact__r\.mailingpostalcode'; Topic = "the mailing postal code of one of the policy's contacts starts with a value in policyRecords" },
+    @{ Type = 'CONTACTNAME'; Field = 'contact__r\.name';              Topic = "the name of one of the policy's contacts is in policyRecords" },
+    @{ Type = 'GROUP';       Field = 'policy__r\.policygroup__c';     Topic = 'the policy group is in policyRecords' },
+    @{ Type = 'AGENCY';      Field = '(?:policy__r\.)?agencynumber__c'; Topic = 'the agency number is in policyRecords, except the policies named in excludeRecords' },
+    @{ Type = 'SYSTEMCODE';  Field = 'systemcode__c';                 Topic = 'the system code is in policyRecords' },
+    @{ Type = 'PRODUCT';     Field = 'productname__c';                Topic = 'the product name is in policyRecords' },
+    @{ Type = 'NUMBER';      Field = '(?:policy__r\.)?policynumber__c'; Topic = 'the policy number is in policyRecords' }
+)
+$contactTypes = @(
+    @{ Type = 'ANNUITANT';    Field = 'role__c';                       Topic = 'the contact is the Annuitant on one of the policy record Ids in policyRecords' },
+    @{ Type = 'EMAILBOUNCED'; Field = 'isemailbounced';                Topic = "the contact's email address has bounced (policyRecords holds true)" },
+    @{ Type = 'POLICYGROUP';  Field = 'policy__r\.policygroup__c';     Topic = "the policy group of one of the contact's policies is in policyRecords" },
+    @{ Type = 'POLICYNUMBER'; Field = 'policy__r\.policynumber__c';    Topic = "the policy number of one of the contact's policies is in policyRecords" },
+    @{ Type = 'GLOBALAGENT';  Field = 'global_agent_id__c';            Topic = "the contact's Global Agent ID is in policyRecords" },
+    @{ Type = 'LSWAGENT';     Field = 'lsw_life_agent_number__c';      Topic = "the contact's LSW Life Agent Number is in policyRecords" },
+    @{ Type = 'POSTCODE';     Field = 'mailingpostalcode';             Topic = "the contact's mailing postal code starts with a value in policyRecords" },
+    @{ Type = 'PARTYID';      Field = 'partyidentifier__c';            Topic = "the contact's Party Identifier is in policyRecords" },
+    @{ Type = 'ACCOUNT';      Field = 'accountid';                     Topic = "the contact's Account Id is in policyRecords" },
+    @{ Type = 'CONTACTNAME';  Field = 'name';                          Topic = "the contact's own name is in policyRecords" }
+)
+
+# the condition that ties the rule to the record being viewed: ... = {0}
+$policyIdCondition  = '(?<![\w.])(?:policy__r\.id|id)\s*=\s*\{0\}'
+$contactIdCondition = '(?<![\w.])(?:contact__r\.id|contact__c|id)\s*=\s*\{0\}'
+
+# ------------------------------------------------------------------ small helpers
+function Escape-Json([string]$s) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $s.ToCharArray()) {
+        switch ([int]$ch) {
+            34      { [void]$sb.Append('\"') }
+            92      { [void]$sb.Append('\\') }
+            10      { [void]$sb.Append('\n') }
+            13      { [void]$sb.Append('\r') }
+            9       { [void]$sb.Append('\t') }
+            default {
+                if ([int]$ch -lt 32) { [void]$sb.Append(('\u{0:x4}' -f [int]$ch)) }
+                else { [void]$sb.Append($ch) }
+            }
+        }
+    }
+    return $sb.ToString()
+}
+
+function Json-List($items) {
+    $parts = @()
+    foreach ($i in $items) { $parts += ('    "' + (Escape-Json $i) + '"') }
+    return "[`n" + ($parts -join ",`n") + "`n  ]"
+}
+
+# reads one quoted text starting at the opening quote; '' inside means one quote
+function Read-Literal([string]$t, [int]$q) {
+    $sb = New-Object System.Text.StringBuilder
+    $i = $q + 1
+    while ($i -lt $t.Length) {
+        if ($t[$i] -eq "'") {
+            if (($i + 1) -lt $t.Length -and $t[$i + 1] -eq "'") { [void]$sb.Append("'"); $i += 2; continue }
+            return [pscustomobject]@{ Value = $sb.ToString(); End = $i + 1; Closed = $true }
+        }
+        [void]$sb.Append($t[$i]); $i++
+    }
+    return [pscustomobject]@{ Value = $sb.ToString(); End = $i; Closed = $false }
+}
+
+# reads 'a', 'b', 'c' ) - anything but quoted texts, commas and spaces is an error
+function Read-List([string]$t, [int]$start) {
+    $values = New-Object System.Collections.Generic.List[string]
+    $i = $start
+    $err = $null
+    while ($i -lt $t.Length) {
+        $c = $t[$i]
+        if ($c -eq "'") {
+            $lit = Read-Literal $t $i
+            if (-not $lit.Closed) { $err = 'a quote is not closed'; break }
+            $values.Add($lit.Value)
+            $i = $lit.End
+        } elseif ($c -eq ')') {
+            return [pscustomobject]@{ Values = $values; End = ($i + 1); Error = $null }
+        } elseif ($c -eq ',' -or [char]::IsWhiteSpace($c)) {
+            $i++
+        } else {
+            $err = "unexpected text '$c' inside the list"
+            break
+        }
+    }
+    if (-not $err) { $err = 'the list is not closed with )' }
+    return [pscustomobject]@{ Values = $values; End = $i; Error = $err }
+}
+
+# finds "field IN (...)", "field NOT IN (...)", "field = '...'" or "field LIKE '...%'"
+function Get-Condition([string]$text, [string]$fieldRegex) {
+    $opt = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+
+    $m = [regex]::Match($text, '(?<![\w])' + $fieldRegex + '\s*(not\s+)?in\s*\(', $opt)
+    if ($m.Success) {
+        $r = Read-List $text ($m.Index + $m.Length)
+        return [pscustomobject]@{ Values = @($r.Values); Start = $m.Index; End = $r.End; Operator = 'IN'
+                                  Negated = $m.Groups[1].Success; Error = $r.Error }
+    }
+
+    $m = [regex]::Match($text, '(?<![\w])' + $fieldRegex + "\s*=\s*'", $opt)
+    if ($m.Success) {
+        $lit = Read-Literal $text ($m.Index + $m.Length - 1)
+        $err = $null
+        if (-not $lit.Closed) { $err = 'a quote is not closed' }
+        return [pscustomobject]@{ Values = @($lit.Value); Start = $m.Index; End = $lit.End; Operator = '='
+                                  Negated = $false; Error = $err }
+    }
+
+    $m = [regex]::Match($text, '(?<![\w])' + $fieldRegex + "\s*like\s*'", $opt)
+    if ($m.Success) {
+        $lit = Read-Literal $text ($m.Index + $m.Length - 1)
+        $err = $null
+        $value = $lit.Value
+        if (-not $lit.Closed) { $err = 'a quote is not closed' }
+        elseif ($value.StartsWith('%')) { $err = "LIKE '$value' starts with % - it means 'contains', which is not supported" }
+        elseif ($value.TrimEnd('%').Contains('%') -or $value.Contains('_')) { $err = "LIKE '$value' uses a wildcard in the middle - not supported" }
+        elseif ($value.EndsWith('%')) { $value = $value.TrimEnd('%') }
+        else { $err = "LIKE '$value' has no % - check it by hand" }
+        return [pscustomobject]@{ Values = @($value); Start = $m.Index; End = $lit.End; Operator = 'LIKE'
+                                  Negated = $false; Error = $err }
+    }
+    return $null
+}
+
+# ------------------------------------------------------------------ one query -> one rule
+function Convert-Query([string]$sheet, [string]$raw) {
+
+    $res = [pscustomobject]@{ Ok = $false; Type = ''; Operator = ''; Values = @(); Excludes = @(); Reason = ''; Notes = ''; Where = '' }
+    $opt = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+
+    if ([string]::IsNullOrWhiteSpace($raw)) { $res.Reason = 'the query is empty'; return $res }
+
+    # the export shows quotes as \'  - make them plain quotes; trim quotes around the whole query
+    $q = $raw -replace "\\'", "'"
+    $q = ($q -replace '\s+', ' ').Trim().Trim('"').Trim()
+
+    $wm = [regex]::Match($q, '\swhere\s', $opt)
+    if (-not $wm.Success) { $res.Reason = 'no WHERE found'; return $res }
+    $where = $q.Substring($wm.Index + $wm.Length)
+    $res.Where = $where
+
+    if ([regex]::IsMatch($where, '\bor\b', $opt)) { $res.Reason = 'the WHERE contains OR'; return $res }
+
+    $types  = if ($sheet -eq 'policy') { $policyTypes } else { $contactTypes }
+    $idCond = if ($sheet -eq 'policy') { $policyIdCondition } else { $contactIdCondition }
+
+    # exactly one known field must be in the WHERE
+    $found = @()
+    foreach ($t in $types) {
+        $field = $t.Field
+        if ($t.Type -eq 'CONTACTNAME' -and $sheet -eq 'contact') { $field = '(?<![\w.])name' ; $pattern = $field + '\s+(?:not\s+)?in' }
+        elseif ($t.Type -eq 'NUMBER' -and $sheet -eq 'policy')   { $pattern = '(?<![\w.])' + $field }
+        else { $pattern = '(?<![\w])' + $field }
+        if ($t.Type -eq 'CONTACTNAME' -and $sheet -eq 'contact') { $pattern = '(?<![\w.])name\s+(?:not\s+)?in' }
+        if ([regex]::IsMatch($where, $pattern, $opt)) { $found += $t }
+    }
+    if ($found.Count -eq 0) { $res.Reason = 'no known field in the WHERE - a new shape'; return $res }
+    if ($found.Count -gt 1) { $res.Reason = 'more than one known field in the WHERE: ' + (($found | ForEach-Object { $_.Type }) -join ', '); return $res }
+    $type = $found[0]
+    $res.Type = $type.Type
+
+    $spans = @()
+
+    # the {0} condition
+    $idm = [regex]::Matches($where, $idCond, $opt)
+    if ($idm.Count -ne 1) { $res.Reason = 'the {0} condition is missing, repeated or on another record'; return $res }
+    $spans += , @($idm[0].Index, ($idm[0].Index + $idm[0].Length))
+
+    $values = @()
+    $excludes = @()
+
+    if ($type.Type -eq 'EMAILBOUNCED') {
+        $em = [regex]::Match($where, '(?<![\w])isemailbounced\s*=\s*true\b', $opt)
+        if (-not $em.Success) { $res.Reason = 'IsEmailBounced is not compared with true'; return $res }
+        $spans += , @($em.Index, ($em.Index + $em.Length))
+        $values = @('true')
+        $res.Operator = '= true'
+    }
+    elseif ($type.Type -eq 'ANNUITANT') {
+        $role = Get-Condition $where 'role__c'
+        if ($null -eq $role -or $role.Error -or $role.Operator -ne '=' -or $role.Values[0] -ne 'Annuitant') {
+            $res.Reason = "the role condition is not Role__c = 'Annuitant'"; return $res
+        }
+        $spans += , @($role.Start, $role.End)
+        $main = Get-Condition $where 'policy__c'
+        if ($null -eq $main -or $main.Error -or $main.Operator -ne 'IN' -or $main.Negated) {
+            $res.Reason = 'Policy__c IN (...) not found or not readable'; if ($main -and $main.Error) { $res.Reason += ': ' + $main.Error }; return $res
+        }
+        $spans += , @($main.Start, $main.End)
+        $values = $main.Values
+        $res.Operator = 'IN'
+    }
+    else {
+        $field = $type.Field
+        if ($type.Type -eq 'CONTACTNAME' -and $sheet -eq 'contact') { $field = 'name' }
+        $main = Get-Condition $where $field
+        if ($null -eq $main) { $res.Reason = 'the condition on ' + $type.Type + ' is not IN, = or LIKE'; return $res }
+        if ($main.Error)     { $res.Reason = $main.Error; return $res }
+        if ($main.Negated)   { $res.Reason = 'NOT IN on ' + $type.Type + ' is not supported'; return $res }
+        $spans += , @($main.Start, $main.End)
+        $values = $main.Values
+        $res.Operator = $main.Operator
+
+        if ($type.Type -eq 'AGENCY') {
+            $ex = Get-Condition $where 'policy__r\.name'
+            if ($null -ne $ex) {
+                if ($ex.Error -or $ex.Operator -ne 'IN' -or -not $ex.Negated) {
+                    $res.Reason = 'the Policy__r.Name condition is not NOT IN (...)'; return $res
+                }
+                $spans += , @($ex.Start, $ex.End)
+                $excludes = $ex.Values
+            }
+        }
+        if ($type.Type -in @('POSTCODE') -and $main.Operator -eq 'IN') {
+            $res.Notes = 'IN in the old rule - the new rule matches "starts with" (a postal code with more digits also matches)'
+        }
+    }
+
+    if (@($values).Count -eq 0) { $res.Reason = 'the list of values is empty'; return $res }
+
+    # nothing may be left in the WHERE except AND and LIMIT
+    $mask = New-Object 'bool[]' $where.Length
+    foreach ($s in $spans) { for ($k = $s[0]; $k -lt $s[1]; $k++) { $mask[$k] = $true } }
+    $left = New-Object System.Text.StringBuilder
+    for ($k = 0; $k -lt $where.Length; $k++) { if (-not $mask[$k]) { [void]$left.Append($where[$k]) } }
+    $rest = $left.ToString()
+    $rest = [regex]::Replace($rest, '\blimit\s+\d+\b', ' ', $opt)
+    $rest = [regex]::Replace($rest, '\band\b', ' ', $opt)
+    $rest = ($rest -replace '\s+', '')
+    if ($rest -ne '') { $res.Reason = "other conditions in the WHERE that the script does not convert: '$rest'"; return $res }
+
+    $res.Values = @($values)
+    $res.Excludes = @($excludes)
+    $res.Ok = $true
+    return $res
+}
+
+# ------------------------------------------------------------------ asking for the files
+function Ask-File([string]$what) {
+    while ($true) {
+        Write-Host ''
+        Write-Host "Where is the $what rules file?  (tip: Shift + right-click the file > 'Copy as path', then paste here)"
+        $p = Read-Host "Path of the $what file (.csv or .xlsx), or just press Enter to skip it"
+        $p = $p.Trim().Trim('"').Trim()
+        if ($p -eq '') { return '' }
+        if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+        Write-Host "  File not found: $p" -ForegroundColor Yellow
+    }
+}
+
+$tempFiles = New-Object System.Collections.Generic.List[string]
+
+# gives back a csv path; an Excel file is saved as CSV UTF-8 in the temp folder (the original is not touched)
+function Get-CsvPath([string]$file) {
+    $ext = [IO.Path]::GetExtension($file).ToLower()
+    if ($ext -eq '.csv') { return $file }
+    if ($ext -in @('.xlsx', '.xls', '.xlsm')) {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('rules-' + [guid]::NewGuid().ToString('N') + '.csv')
+        $excel = $null
+        try {
+            $excel = New-Object -ComObject Excel.Application
+            $excel.Visible = $false
+            $excel.DisplayAlerts = $false
+            $wb = $excel.Workbooks.Open($file, 0, $true)
+            $wb.SaveAs($tmp, 62)
+            $wb.Close($false)
+        } catch {
+            throw "Could not read the Excel file '$file'. Open it in Excel, Save As 'CSV UTF-8 (Comma delimited)' and use that file. ($($_.Exception.Message))"
+        } finally {
+            if ($excel) { $excel.Quit(); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+        }
+        $tempFiles.Add($tmp)
+        return $tmp
+    }
+    throw "Unsupported file type '$ext' for '$file'. Use .csv or .xlsx"
+}
+
+function Read-Rules([string]$path) {
+    $first = Get-Content -LiteralPath $path -TotalCount 1 -Encoding UTF8
+    $delimiter = ','
+    if ($first -match ';' -and $first -notmatch ',') { $delimiter = ';' }
+    return @(Import-Csv -LiteralPath $path -Encoding UTF8 -Delimiter $delimiter)
+}
+
+function Find-Column($rows, [string]$pattern) {
+    return @($rows[0].PSObject.Properties.Name | Where-Object { $_ -match $pattern })
+}
+
+# ------------------------------------------------------------------ main
+if (-not $PolicyFile -and -not $ContactFile) {
+    Write-Host 'Rule criteria -> static resource files (nothing is deployed)'
+    $PolicyFile  = Ask-File 'POLICY'
+    $ContactFile = Ask-File 'CONTACT'
+}
+if (-not $PolicyFile -and -not $ContactFile) { throw 'No file given - nothing to do.' }
+
+$outRoot = Join-Path $OutputRoot $FolderName
+$dirs = @{ policy = (Join-Path $outRoot 'Policy Rules'); contact = (Join-Path $outRoot 'Contact Rules') }
+if (Test-Path -LiteralPath $outRoot) {
+    throw "The folder '$outRoot' already exists. Rename or delete it first, so old and new files are never mixed."
+}
+foreach ($d in $dirs.Values) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$metaXml = @'
+<?xml version="1.0" encoding="UTF-8"?>
+<StaticResource xmlns="http://soap.sforce.com/2006/04/metadata">
+    <cacheControl>Public</cacheControl>
+    <contentType>application/json</contentType>
+</StaticResource>
+'@
+
+$recon  = New-Object System.Collections.Generic.List[object]
+$review = New-Object System.Collections.Generic.List[object]
+$summary = New-Object System.Collections.Generic.List[string]
+$summary.Add("Rule conversion  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
+$summary.Add("Output folder: $outRoot")
+$summary.Add('')
+
+foreach ($sheet in @('policy', 'contact')) {
+
+    $inputFile = if ($sheet -eq 'policy') { $PolicyFile } else { $ContactFile }
+    if (-not $inputFile) {
+        $summary.Add("[$sheet] no file given - skipped")
+        Write-Host "[$sheet] no file given - skipped" -ForegroundColor Yellow
+        continue
+    }
+    $csvName = Split-Path $inputFile -Leaf
+    $csvPath = Get-CsvPath $inputFile
+
+    $rows = Read-Rules $csvPath
+    if ($rows.Count -eq 0) { $summary.Add("[$sheet] $csvName has no rows"); continue }
+
+    $queryCol   = (Find-Column $rows 'query') | Select-Object -First 1
+    $messageCandidates = @()
+    foreach ($pattern in @('^content', 'content', 'message')) { $messageCandidates += @(Find-Column $rows $pattern) }
+    $contentCol = $messageCandidates | Select-Object -First 1
+    $activeCols = @(Find-Column $rows 'active')
+    $idCol      = (Find-Column $rows '^(?i:id)$') | Select-Object -First 1
+    $objectCol  = (Find-Column $rows 'object') | Select-Object -First 1
+
+    if (-not $queryCol -or -not $contentCol) {
+        throw "[$sheet] could not find the query column or the message column in $csvName. Columns found: $($rows[0].PSObject.Properties.Name -join ', ')"
+    }
+    $info = "[$sheet] $csvName  columns used -> query: '$queryCol'  message: '$contentCol'  active: '$($activeCols -join ', ')'  id: '$idCol'  object: '$objectCol'"
+    Write-Host $info
+    $summary.Add($info)
+
+    $topics = @{}
+    $typeList = if ($sheet -eq 'policy') { $policyTypes } else { $contactTypes }
+    foreach ($t in $typeList) { $topics[$t.Type] = $t.Topic }
+
+    $counters = @{}
+    $inactive = 0; $converted = 0; $toReview = 0
+    $prefix = if ($sheet -eq 'policy') { 'CTX_POLICY_' } else { 'CTX_CONTACT_' }
+
+    $rowNumber = 1
+    foreach ($row in $rows) {
+        $rowNumber++
+        $ruleId = if ($idCol) { [string]$row.$idCol } else { '' }
+
+        $isActive = $true
+        foreach ($c in $activeCols) {
+            $v = [string]$row.$c
+            if ($v -ne '' -and $v -notmatch '^(?i:true|1|yes)$') { $isActive = $false }
+        }
+        if (-not $isActive) { $inactive++; continue }
+
+        $query   = [string]$row.$queryCol
+        $message = [string]$row.$contentCol
+
+        if ($objectCol) {
+            $objectName = [string]$row.$objectCol
+            $isPolicyRule = ($objectName -match 'PolicyMaster')
+            $isContactRule = ($objectName -match '(?i)^\s*contact\s*$')
+            if ($objectName -ne '' -and (($sheet -eq 'policy' -and -not $isPolicyRule) -or ($sheet -eq 'contact' -and -not $isContactRule))) {
+                $toReview++
+                $review.Add([pscustomobject]@{ Sheet = $sheet; Row = $rowNumber; RuleId = $ruleId
+                    Reason = "RuleObject is '$objectName' - it does not belong in the $sheet file"; Query = $query })
+                continue
+            }
+        }
+        $conv = Convert-Query $sheet $query
+
+        if ($conv.Ok -and [string]::IsNullOrWhiteSpace($message)) {
+            $conv.Ok = $false; $conv.Reason = 'the message (Content__c) is empty'
+        }
+
+        if (-not $conv.Ok) {
+            $toReview++
+            $review.Add([pscustomobject]@{ Sheet = $sheet; Row = $rowNumber; RuleId = $ruleId; Reason = $conv.Reason; Query = $query })
+            continue
+        }
+
+        if (-not $counters.ContainsKey($conv.Type)) { $counters[$conv.Type] = 0 }
+        $counters[$conv.Type]++
+        $fileName = '{0}{1}_{2:D3}' -f $prefix, $conv.Type, $counters[$conv.Type]
+
+        $source = if ($ruleId) { "rule $ruleId" } else { "row $rowNumber of $csvName" }
+        $page   = if ($sheet -eq 'policy') { 'Policy' } else { 'Contact' }
+        $description = "$page page rule ($($conv.Type)): the banner shows when $($topics[$conv.Type]). Converted from $source."
+
+        $json = "{`n  `"message`": `"" + (Escape-Json $message) + "`",`n" +
+                "  `"description`": `"" + (Escape-Json $description) + "`",`n" +
+                "  `"policyRecords`": " + (Json-List $conv.Values)
+        if (@($conv.Excludes).Count -gt 0) { $json += ",`n  `"excludeRecords`": " + (Json-List $conv.Excludes) }
+        $json += "`n}`n"
+
+        [System.IO.File]::WriteAllText((Join-Path $dirs[$sheet] "$fileName.json"), $json, $utf8)
+        [System.IO.File]::WriteAllText((Join-Path $dirs[$sheet] "$fileName.resource-meta.xml"), ($metaXml + "`n"), $utf8)
+        $converted++
+
+        # ---- independent check: read the file back, and read the query a second way
+        $file = Get-Content -LiteralPath (Join-Path $dirs[$sheet] "$fileName.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+        $inFile = @(); foreach ($x in @($file.policyRecords)) { $inFile += [string]$x }
+        $exFile = @(); if ($file.PSObject.Properties.Name -contains 'excludeRecords') { foreach ($x in @($file.excludeRecords)) { $exFile += [string]$x } }
+
+        $tokens = New-Object System.Collections.Generic.List[string]
+        foreach ($m in [regex]::Matches($conv.Where, "'((?:[^']|'')*)'")) {
+            $tok = $m.Groups[1].Value -replace "''", "'"
+            if ($conv.Operator -eq 'LIKE') { $tok = $tok.TrimEnd('%') }
+            $tokens.Add($tok)
+        }
+        if ($conv.Type -eq 'ANNUITANT') {
+            for ($k = 0; $k -lt $tokens.Count; $k++) { if ($tokens[$k] -eq 'Annuitant') { $tokens.RemoveAt($k); break } }
+        }
+        $expected = @($inFile) + @($exFile)
+        if ($conv.Type -eq 'EMAILBOUNCED') { $tokens.Clear(); $tokens.Add('true') }
+
+        $a = [string[]]@($tokens.ToArray()); [Array]::Sort($a, [StringComparer]::Ordinal)
+        $b = [string[]]@($expected);          [Array]::Sort($b, [StringComparer]::Ordinal)
+        $same = ($a.Length -eq $b.Length)
+        if ($same) { for ($k = 0; $k -lt $a.Length; $k++) { if ($a[$k] -cne $b[$k]) { $same = $false; break } } }
+        $messageSame = ([string]$file.message -ceq $message)
+        $result = if ($same -and $messageSame) { 'OK' } else { 'DIFFERENT' }
+        if ($result -ne 'OK') { Write-Host "  DIFFERENT: $fileName ($source)" -ForegroundColor Red }
+
+        $dupes = ($inFile.Count - (@($inFile | Select-Object -Unique)).Count)
+        $spaces = @($inFile | Where-Object { $_ -ne $_.Trim() }).Count
+        $notes = @($conv.Notes)
+        if ($dupes -gt 0)  { $notes += "$dupes duplicate value(s) kept as in the old query" }
+        if ($spaces -gt 0) { $notes += "$spaces value(s) with a space at the start or end" }
+
+        $recon.Add([pscustomobject]@{
+            Sheet = $sheet; Row = $rowNumber; RuleId = $ruleId; Type = $conv.Type; File = $fileName
+            Operator = $conv.Operator; ValuesInQuery = $tokens.Count; ValuesInFile = $expected.Count
+            Excludes = $exFile.Count; MessageMatches = $messageSame; Result = $result; Notes = ($notes -join '; ')
+        })
+    }
+
+    $sizeKb = [math]::Round((Get-ChildItem -LiteralPath $dirs[$sheet] -Filter '*.json' | Measure-Object Length -Sum).Sum / 1KB, 1)
+    $summary.Add("[$sheet] rows: $($rows.Count)   inactive skipped: $inactive   converted: $converted   needs review: $toReview   size of the json files: $sizeKb KB")
+    foreach ($k in ($counters.Keys | Sort-Object)) { $summary.Add("        $k : $($counters[$k]) file(s)") }
+    Write-Host "[$sheet] rows $($rows.Count), inactive $inactive, converted $converted, needs review $toReview, $sizeKb KB"
+}
+
+$recon  | Export-Csv -LiteralPath (Join-Path $outRoot 'RECONCILIATION.csv') -NoTypeInformation -Encoding UTF8
+$review | Export-Csv -LiteralPath (Join-Path $outRoot 'NEEDS-REVIEW.csv')   -NoTypeInformation -Encoding UTF8
+
+$bad = @($recon | Where-Object { $_.Result -ne 'OK' }).Count
+$summary.Add('')
+$summary.Add("Files written: $($recon.Count)   reconciled OK: $($recon.Count - $bad)   DIFFERENT: $bad   needs review: $($review.Count)")
+if ($bad -eq 0 -and $review.Count -eq 0) { $summary.Add('Every active rule is a file, and every file matches its rule.') }
+else { $summary.Add('NOT FINISHED: open RECONCILIATION.csv (Result = DIFFERENT) and NEEDS-REVIEW.csv.') }
+[System.IO.File]::WriteAllLines((Join-Path $outRoot 'SUMMARY.txt'), $summary, $utf8)
+
+Write-Host ''
+$summary | Select-Object -Last 3 | ForEach-Object { Write-Host $_ }
+Write-Host "Folder: $outRoot"
+foreach ($f in $tempFiles) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
