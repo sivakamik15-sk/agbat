@@ -1,0 +1,7 @@
+{
+  "message": "TEST - banner for the contact with party identifier E7E1B31F-BF08-EA11-A2ED-00505696178B",
+  "description": "TEST - demo of a party identifier rule, replace with the real message and the real party identifiers",
+  "policyRecords": [
+    "E7E1B31F-BF08-EA11-A2ED-00505696178B"
+  ]
+}
