@@ -1,0 +1,9 @@
+{
+  "message": "TEST - banner for contacts who are the annuitant on one of the listed policies",
+  "description": "TEST - demo of an annuitant rule, replace the Ids with real policy record Ids of this org and the message with the real one",
+  "policyRecords": [
+    "a320b000002P6NxAAK",
+    "a320b000001zUSWAA2",
+    "a320b000001zCqoAAE"
+  ]
+}
