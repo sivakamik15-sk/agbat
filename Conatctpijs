@@ -1,0 +1,270 @@
+import { LightningElement, api, wire } from 'lwc';
+import { getRecord } from 'lightning/uiRecordApi';
+import getRules from '@salesforce/apex/ContextualBannerController.getRules';
+import getLinkedContacts from '@salesforce/apex/ContextualBannerController.getLinkedContacts';
+import getLinkedPolicyGroups from '@salesforce/apex/ContextualBannerController.getLinkedPolicyGroups';
+import getLinkedPolicyNumbers from '@salesforce/apex/ContextualBannerController.getLinkedPolicyNumbers';
+import getAnnuitantPolicies from '@salesforce/apex/ContextualBannerController.getAnnuitantPolicies';
+
+/**
+ * contextualBannerAlert
+ *
+ * Apex returns every rule for the object this page is on - one rule per
+ * static resource file, each with its message and its list of values.
+ * The comparison with the record being viewed happens here.
+ *
+ * The NAME of a rule's file says which field of the record its list is
+ * compared with:
+ *   CTX_POLICYGROUP_*  -> the PolicyGroup__c field of the policy
+ *   CTX_POLICY_*       -> the PolicyNumber__c field of the policy
+ *   CTX_POSTCODE_*     -> the postal codes of the policy's contacts (starts with)
+ *   CTX_POLICY_CONTACTNAME_* -> the names of the policy's contacts
+ *   CTX_PRODUCT_*      -> the ProductName__c field of the policy
+ *   CTX_SYSTEMCODE_*   -> the SystemCode__c field of the policy
+ *   CTX_AGENCY_*       -> the AgencyNumber__c field of the policy, except the policies
+ *                         named in the rule's optional excludeRecords list (compared with Name)
+ *   CTX_CONTACT_GLOBALAGENT_* -> the Global_Agent_ID__c field of the contact
+ *   CTX_CONTACT_LSWAGENT_*    -> the LSW_Life_Agent_Number__c field of the contact
+ *   CTX_CONTACT_POLICYGROUP_* -> the policy groups of the contact's policies
+ *   CTX_CONTACT_POLICYNUMBER_* -> the policy numbers of the contact's policies
+ *   CTX_CONTACT_ANNUITANT_*   -> the listed policy record Ids on which the contact is the Annuitant
+ *   CTX_CONTACT_EMAILBOUNCED_* -> the IsEmailBounced checkbox of the contact (the list holds "true")
+ *   CTX_CONTACT_PARTYID_*     -> the PartyIdentifier__c field of the contact
+ *   CTX_CONTACT_POSTCODE_*    -> the MailingPostalCode field of the contact (starts with)
+ *   CTX_CONTACT_CONTACTNAME_* -> the Name of the contact
+ *   CTX_CONTACT_*      -> the record Id of the contact
+ * To support another category, add one line to RULE_FIELDS.
+ *
+ * match: 'equals' (default) - the value must equal an entry of the list
+ *        'startsWith'       - the value must start with an entry of the list
+ */
+// not fields - the contacts of a policy are loaded by Apex
+const POSTAL_CODES  = 'LinkedPostalCodes';
+const CONTACT_NAMES = 'LinkedContactNames';
+const LINKED_POLICY_GROUPS = 'LinkedPolicyGroups';   // the contact page - loaded by Apex
+const LINKED_POLICY_NUMBERS = 'LinkedPolicyNumbers'; // the contact page - loaded by Apex
+const ANNUITANT_POLICIES = 'AnnuitantPolicies';      // the contact page - loaded by Apex
+
+const RULE_FIELDS = [
+    // the longer prefix first: CTX_POLICY_CONTACTNAME_ also starts with CTX_POLICY_
+    { prefix: 'CTX_POLICY_CONTACTNAME_', field: CONTACT_NAMES },
+    { prefix: 'CTX_POLICYGROUP_', field: 'PolicyGroup__c' },
+    { prefix: 'CTX_POLICY_',      field: 'PolicyNumber__c' },
+    { prefix: 'CTX_POSTCODE_',    field: POSTAL_CODES, match: 'startsWith' },
+    { prefix: 'CTX_PRODUCT_',     field: 'ProductName__c' },
+    { prefix: 'CTX_SYSTEMCODE_',  field: 'SystemCode__c' },
+    { prefix: 'CTX_AGENCY_',      field: 'AgencyNumber__c', excludeField: 'Name' },
+    // contact page - the longer prefix first: CTX_CONTACT_GLOBALAGENT_ also starts with CTX_CONTACT_
+    { prefix: 'CTX_CONTACT_GLOBALAGENT_', field: 'Global_Agent_ID__c' },
+    { prefix: 'CTX_CONTACT_LSWAGENT_',    field: 'LSW_Life_Agent_Number__c' },
+    { prefix: 'CTX_CONTACT_POLICYGROUP_', field: LINKED_POLICY_GROUPS },
+    { prefix: 'CTX_CONTACT_POLICYNUMBER_', field: LINKED_POLICY_NUMBERS },
+    { prefix: 'CTX_CONTACT_ANNUITANT_', field: ANNUITANT_POLICIES },
+    { prefix: 'CTX_CONTACT_EMAILBOUNCED_', field: 'IsEmailBounced' },
+    { prefix: 'CTX_CONTACT_PARTYID_',     field: 'PartyIdentifier__c' },
+    { prefix: 'CTX_CONTACT_POSTCODE_',    field: 'MailingPostalCode', match: 'startsWith' },
+    { prefix: 'CTX_CONTACT_CONTACTNAME_', field: 'Name' },
+    { prefix: 'CTX_CONTACT_',     field: 'Id' }
+];
+
+// Fields to read per object. Required fields must be readable by the user.
+// Optional fields are skipped quietly when the user cannot read them, so one
+// unreadable field never hides the other banners.
+const OBJECT_FIELDS = {
+    PolicyMaster__c: { required: ['PolicyNumber__c'], optional: ['PolicyGroup__c', 'ProductName__c', 'AgencyNumber__c', 'Name', 'SystemCode__c'] },
+    Contact:         { required: [],                  optional: ['Global_Agent_ID__c', 'LSW_Life_Agent_Number__c', 'MailingPostalCode', 'Name', 'IsEmailBounced', 'PartyIdentifier__c'] }
+};
+
+const BANNER_CLASS =
+    'slds-notify slds-notify_alert slds-theme_alert-texture slds-theme_warning';
+
+export default class ContextualBannerAlert extends LightningElement {
+    @api recordId;
+    @api objectApiName;
+
+    ruleObject;       // object to load rules for - stays undefined if unsupported
+    recordFields;     // fields that must be read - undefined when none are needed
+    optionalFields;   // fields read when the user may see them
+    rules;            // every rule for this object, from Apex
+    fieldValues = {}; // this record's values read through Lightning Data Service
+    postalCodes = []; // postal codes of the policy's contacts, from Apex
+    contactNames = []; // names of the policy's contacts, from Apex
+    linkedLookupId;   // set only when a rule uses the policy's contacts - then Apex is asked
+    policyGroups = []; // policy groups of the contact's policies, from Apex
+    policyGroupLookupId; // set only when a rule uses the contact's policies - then Apex is asked
+    linkedPolicyNumbers = []; // the listed policy numbers that belong to the contact's policies, from Apex
+    policyNumberLookupId;     // set only when a policy number rule exists - then Apex is asked
+    policyNumberCandidates;   // the policy numbers listed in those rules
+    annuitantPolicies = [];   // the listed policy Ids on which the contact is the Annuitant, from Apex
+    annuitantLookupId;        // set only when an annuitant rule exists - then Apex is asked
+    annuitantCandidates;      // the policy Ids listed in those rules
+
+    connectedCallback() {
+        const config = OBJECT_FIELDS[this.objectApiName];
+        if (!config) { return; }              // unsupported object - show nothing
+
+        this.ruleObject = this.objectApiName;
+        const withObject = field => this.objectApiName + '.' + field;
+        this.recordFields = config.required.length ? config.required.map(withObject) : undefined;
+        this.optionalFields = config.optional.length ? config.optional.map(withObject) : undefined;
+    }
+
+    // One call returns the rules of every file for this object. The call takes
+    // no record Id, so the browser can reuse the result for every record.
+    @wire(getRules, { objectApiName: '$ruleObject' })
+    wiredRules({ data, error }) {
+        if (data) {
+            this.rules = data;
+            // the policy's contacts cost one query, so ask only if a rule uses them
+            const usesContacts = data.some(rule => {
+                const field = this.fieldFor(rule.name);
+                return field === POSTAL_CODES || field === CONTACT_NAMES;
+            });
+            this.linkedLookupId = usesContacts ? this.recordId : undefined;
+            const usesPolicyGroups = data.some(rule => this.fieldFor(rule.name) === LINKED_POLICY_GROUPS);
+            this.policyGroupLookupId = usesPolicyGroups ? this.recordId : undefined;
+
+            // Apex is given the listed policy numbers, so its answer is never larger than the lists
+            const candidates = Array.from(new Set(
+                data.filter(rule => this.fieldFor(rule.name) === LINKED_POLICY_NUMBERS)
+                    .flatMap(rule => (rule.policyRecords || []).map(v => String(v).trim()))
+                    .filter(v => v !== '')));
+            this.policyNumberLookupId = candidates.length ? this.recordId : undefined;
+            this.policyNumberCandidates = candidates.length ? candidates : undefined;
+
+            const policyIds = Array.from(new Set(
+                data.filter(rule => this.fieldFor(rule.name) === ANNUITANT_POLICIES)
+                    .flatMap(rule => (rule.policyRecords || []).map(v => String(v).trim()))
+                    .filter(v => v !== '')));
+            this.annuitantLookupId = policyIds.length ? this.recordId : undefined;
+            this.annuitantCandidates = policyIds.length ? policyIds : undefined;
+        } else if (error) {
+            this.logError(error, 'loading the rules');
+        }
+    }
+
+    @wire(getLinkedContacts, { policyId: '$linkedLookupId' })
+    wiredLinkedContacts({ data, error }) {
+        if (data) {
+            this.postalCodes = data.postalCodes || [];
+            this.contactNames = data.names || [];
+        } else if (error) {
+            this.logError(error, 'loading the contacts of the policy');
+        }
+    }
+
+    @wire(getLinkedPolicyGroups, { contactId: '$policyGroupLookupId' })
+    wiredPolicyGroups({ data, error }) {
+        if (data) {
+            this.policyGroups = data;
+        } else if (error) {
+            this.logError(error, 'loading the policies of the contact');
+        }
+    }
+
+    @wire(getLinkedPolicyNumbers, { contactId: '$policyNumberLookupId', policyNumbers: '$policyNumberCandidates' })
+    wiredPolicyNumbers({ data, error }) {
+        if (data) {
+            this.linkedPolicyNumbers = data;
+        } else if (error) {
+            this.logError(error, 'loading the policy numbers of the contact');
+        }
+    }
+
+    @wire(getAnnuitantPolicies, { contactId: '$annuitantLookupId', policyIds: '$annuitantCandidates' })
+    wiredAnnuitantPolicies({ data, error }) {
+        if (data) {
+            this.annuitantPolicies = data;
+        } else if (error) {
+            this.logError(error, 'loading the annuitant policies of the contact');
+        }
+    }
+
+    // Lightning Data Service - the record is already loaded for the page
+    @wire(getRecord, {
+        recordId: '$recordId',
+        fields: '$recordFields',
+        optionalFields: '$optionalFields'
+    })
+    wiredRecord({ data, error }) {
+        if (data) {
+            const values = {};
+            Object.keys(data.fields).forEach(name => {
+                values[name] = data.fields[name].value;
+            });
+            this.fieldValues = values;
+        } else if (error) {
+            this.logError(error, 'reading the record');
+        }
+    }
+
+    // The values of a field for this record, as a list - a contact is identified
+    // by its Id, which is already known, and a policy has several contacts.
+    valuesOf(field) {
+        if (field === POSTAL_CODES) { return this.postalCodes; }
+        if (field === CONTACT_NAMES) { return this.contactNames; }
+        if (field === LINKED_POLICY_GROUPS) { return this.policyGroups; }
+        if (field === LINKED_POLICY_NUMBERS) { return this.linkedPolicyNumbers; }
+        if (field === ANNUITANT_POLICIES) { return this.annuitantPolicies; }
+        const value = field === 'Id' ? this.recordId : this.fieldValues[field];
+        return (value === undefined || value === null || value === '') ? [] : [value];
+    }
+
+    // Which entry of RULE_FIELDS a rule belongs to, from the file name
+    entryFor(ruleName) {
+        const name = String(ruleName).toUpperCase();
+        return RULE_FIELDS.find(entry => name.startsWith(entry.prefix));
+    }
+
+    // Which field a rule's list is compared with, from the file name
+    fieldFor(ruleName) {
+        const entry = this.entryFor(ruleName);
+        return entry ? entry.field : undefined;
+    }
+
+    // True when the rule names this record in its optional excludeRecords list
+    isExcluded(rule, entry) {
+        if (!entry.excludeField || !Array.isArray(rule.excludeRecords)) { return false; }
+
+        const excluded = rule.excludeRecords
+            .map(v => String(v).trim().toUpperCase())
+            .filter(v => v !== '');
+        return this.valuesOf(entry.excludeField)
+            .map(v => String(v).trim().toUpperCase())
+            .some(value => excluded.includes(value));
+    }
+
+    /** The banners to show: every rule whose list matches a value of this record. */
+    get banners() {
+        if (!this.rules) { return []; }
+
+        return this.rules
+            .filter(rule => {
+                const entry = this.entryFor(rule.name);
+                if (!entry || !Array.isArray(rule.policyRecords)) { return false; }
+
+                const listed = rule.policyRecords
+                    .map(v => String(v).trim().toUpperCase())
+                    .filter(v => v !== '');
+                const startsWith = entry.match === 'startsWith';
+
+                const matches = this.valuesOf(entry.field)
+                    .map(v => String(v).trim().toUpperCase())
+                    .some(value => listed.some(item =>
+                        startsWith ? value.startsWith(item) : value === item));
+
+                return matches && !this.isExcluded(rule, entry);
+            })
+            .map(rule => ({
+                key: rule.name,
+                message: rule.message,
+                cssClass: BANNER_CLASS
+            }));
+    }
+
+    logError(error, doing) {
+        // a failure must never break the page - log the real message, show nothing
+        console.error('Contextual banner - problem ' + doing + ':',
+            (error && error.body && error.body.message) ? error.body.message : error);
+    }
+}
