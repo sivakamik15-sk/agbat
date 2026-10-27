@@ -1,0 +1,7 @@
+{
+  "message": "TEST - banner for contacts linked to policy NG1566649X",
+  "description": "TEST - demo of a contact page policy number rule, replace with the real message",
+  "policyRecords": [
+    "NG1566649X"
+  ]
+}
