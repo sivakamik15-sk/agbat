@@ -1,0 +1,6 @@
+@echo off
+rem Runs convert-rules.ps1. It asks you for the policy file and the contact file,
+rem then writes the static resource files. It never deploys anything.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0convert-rules.ps1"
+echo.
+pause
