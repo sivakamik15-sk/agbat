@@ -1,0 +1,13 @@
+// Calls the NEW controller exactly as the LWC does and prints how many queries it used.
+// Expected: 1 query for the whole page, however many CTX_ files exist.
+// Run:  sf apex run --file "2-new-way-query-count.apex" --target-org dev4cc
+// Then look for the lines starting with USER_DEBUG in the output.
+for (String obj : new List<String>{ 'PolicyMaster__c', 'Contact' }) {
+    Integer before = Limits.getQueries();
+    List<ContextualBannerHelper.Rule> rules = ContextualBannerController.getRules(obj);
+    Integer used = Limits.getQueries() - before;
+    System.debug('PROOF ' + obj + ': ' + rules.size() + ' rule files read, queries used: ' + used + ' (limit ' + Limits.getLimitQueries() + ')');
+    for (ContextualBannerHelper.Rule r : rules) {
+        System.debug('PROOF   ' + r.name + ' -> ' + r.policyRecords.size() + ' value(s)');
+    }
+}
