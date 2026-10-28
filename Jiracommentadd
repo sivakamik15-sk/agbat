@@ -1,0 +1,17 @@
+As part of improving the Contextual Message component, we have optimized how the contextual message rules are checked, so that the messages keep showing even when many rules are set up.
+
+Current Process
+- Each contextual message rule is checked separately when a record page opens.
+- When there are many rules, the system reaches its limit and stops.
+- When this happens, none of the contextual messages are shown on the page.
+
+New Process
+- Each rule is now kept in its own file. The file holds the message and the list of records it applies to.
+- Policy rule files start with CTX_POLICY_ and contact rule files start with CTX_CONTACT_, so it is easy to tell which page a rule belongs to.
+- All the rule files for a page are read together in one step instead of one by one.
+- The page then compares the rules with the record being viewed and shows the matching messages.
+- To add, change or remove a rule, only its file needs to be updated. No code change is required.
+
+This enhancement ensures that the component handles any number of rules without reaching system limits, improving reliability and making rules easier to maintain.
+
+The changes are completed in the dev environment and testing is in progress.
