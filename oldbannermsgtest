@@ -1,0 +1,13 @@
+// Same pattern as the old banner engine: one query for each rule.
+Integer rulesToCheck = 120;                       // pretend there are 120 rules
+List<String> banners = new List<String>();        // what the page would show
+
+for (Integer i = 1; i <= rulesToCheck; i++) {
+    List<Contact> rows = [SELECT Id FROM Contact LIMIT 1];   // 1 query for this rule
+    banners.add('Banner message for rule ' + i);
+    if (Math.mod(i, 25) == 0) {
+        System.debug('Rule ' + i + ' checked. Queries used: ' + Limits.getQueries() + ' of ' + Limits.getLimitQueries());
+    }
+}
+
+System.debug('Banners returned to the page: ' + banners.size());   // never reached
