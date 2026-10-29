@@ -1,0 +1,7 @@
+{
+  "message": "TEST - banner for one specific contact",
+  "description": "TEST - demo of a contact Id rule, replace with the real message and with contact Ids of this org",
+  "policyRecords": [
+    "003000000000000AAA"
+  ]
+}
