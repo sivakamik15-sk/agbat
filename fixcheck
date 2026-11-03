@@ -1,0 +1,3 @@
+Id policyId = 'a3203000000395KAAQ';
+System.debug('RULES: ' + ContextualBannerController.getRules('PolicyMaster__c'));
+System.debug('RELATED: ' + ContextualBannerController.getRelatedValues(policyId, 'CTX_POLICY_CLARKCONTACT'));
