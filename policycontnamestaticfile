@@ -1,0 +1,15 @@
+{
+  "message": "TEST - a contact of the policy belongs to the listed account",
+  "description": "Related records two lookups away: PolicyContact__c -> Contact -> Account name. Never possible before without a code change. Replace the value with the name of an account whose contact is linked to a dev policy.",
+  "criteria": {
+    "related": {
+      "objectApiName": "PolicyContact__c",
+      "linkField": "Policy__c"
+    },
+    "field": "Contact__r.Account.Name",
+    "match": "equals"
+  },
+  "policyRecords": [
+    "REPLACE_WITH_AN_ACCOUNT_NAME"
+  ]
+}
