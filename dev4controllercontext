@@ -1,0 +1,183 @@
+/**
+ * ContextualBannerController
+ *
+ * The only class the LWC calls. It knows no field, no object and no rule type:
+ * everything it does is driven by the "criteria" written in the rule files.
+ *
+ *   getRules(objectApiName)
+ *       every usable rule for a page, with its message, its values and its criteria.
+ *       ONE query (the static resources). The criteria were checked against the schema
+ *       by ContextualBannerHelper, so the LWC receives only names that exist.
+ *
+ *   getRelatedValues(recordId, ruleName)
+ *       for a rule whose criteria name RELATED records: the values of the field on the
+ *       records linked to the page's record. One call per distinct kind of criterion,
+ *       however many rules share it - 150 postcode rules cost one call.
+ *       The caller sends only a rule name; the object and field names come from the
+ *       rule file, never from the caller, so this cannot be used to read anything a rule
+ *       file does not name.
+ *
+ * Each call is its own transaction, so a new kind of criterion can never add to the
+ * 100 query limit of another. A failure returns an empty list rather than an error,
+ * so the page is never broken by the banner.
+ */
+public with sharing class ContextualBannerController {
+
+    /** Rules for a page. The method takes no record Id, so the browser can cache the result. */
+    @AuraEnabled(cacheable=true)
+    public static List<ContextualBannerHelper.Rule> getRules(String objectApiName) {
+
+        List<ContextualBannerHelper.Rule> empty = new List<ContextualBannerHelper.Rule>();
+
+        try {
+            return ContextualBannerHelper.getRulesFor(objectApiName);   // unsupported object: empty, no query
+
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR,
+                'ContextualBanner - getRules failed for ' + objectApiName
+                + ': ' + e.getMessage());
+            return empty;
+        }
+    }
+
+    /**
+     * The values of a rule's field on the records linked to recordId. ruleName is the file
+     * name of any one rule of that kind. Cacheable: the answer depends only on the arguments.
+     */
+    @AuraEnabled(cacheable=true)
+    public static List<String> getRelatedValues(Id recordId, String ruleName) {
+
+        List<String> empty = new List<String>();
+        if (recordId == null || String.isBlank(ruleName)) { return empty; }
+
+        try {
+            String pageObject = String.valueOf(recordId.getSObjectType());
+            return valuesFor(recordId, ruleName, ContextualBannerHelper.getRulesFor(pageObject));
+
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR,
+                'ContextualBanner - getRelatedValues failed for ' + recordId + ' / ' + ruleName
+                + ': ' + e.getMessage());
+            return empty;
+        }
+    }
+
+    /**
+     * The lookup itself, given the usable rules of the page. ONE query.
+     *
+     * Rules with the same criteria share one lookup. When the rules compare for equality
+     * (or by Id) the query asks only for the listed values, so the answer can never be
+     * larger than the lists, however many linked records exist. Otherwise (startsWith, or
+     * very long lists) it asks for the distinct values - grouped in the query where the
+     * field allows it - so a record with thousands of links still returns few rows.
+     */
+    public static List<String> valuesFor(Id recordId, String ruleName,
+                                         List<ContextualBannerHelper.Rule> rules) {
+
+        List<String> result = new List<String>();
+
+        ContextualBannerHelper.Rule rule = null;
+        for (ContextualBannerHelper.Rule r : rules) {
+            if (r.name != null && r.name.equalsIgnoreCase(ruleName)) { rule = r; break; }
+        }
+        if (rule == null || rule.criteria == null || rule.criteria.related == null) { return result; }
+
+        ContextualBannerHelper.Criteria c = rule.criteria;
+        ContextualBannerHelper.Related rel = c.related;
+
+        Schema.DescribeFieldResult valueField = ContextualBannerHelper.fieldInfo(rel.objectApiName, c.field);
+        if (valueField == null) { return result; }
+        Schema.DisplayType valueType = valueField.getType();
+
+        // the links to this record, plus the rule's own conditions
+        Map<String, Object> binds = new Map<String, Object>{ 'recordId' => recordId };
+        List<String> conditions = new List<String>{ rel.linkField + ' = :recordId' };
+        Integer n = 0;
+        for (ContextualBannerHelper.Filter f : rel.filters) {
+            Schema.DescribeFieldResult fd = ContextualBannerHelper.fieldInfo(rel.objectApiName, f.field);
+            if (fd == null) { return result; }
+            if (fd.getType() == Schema.DisplayType.BOOLEAN) {
+                binds.put('f' + n, Boolean.valueOf(f.value));
+            } else {
+                binds.put('f' + n, f.value);
+            }
+            conditions.add(f.field + ' = :f' + n);
+            n++;
+        }
+
+        // the values listed by every rule of this kind
+        Set<String> listed = new Set<String>();
+        if (c.match != 'startsWith') {
+            for (ContextualBannerHelper.Rule r : rules) {
+                if (r.criteria != null && r.criteria.shape == c.shape && r.policyRecords != null) {
+                    for (String v : r.policyRecords) {
+                        if (!String.isBlank(v)) { listed.add(v.trim()); }
+                    }
+                }
+            }
+        }
+
+        Boolean isReference = (valueType == Schema.DisplayType.REFERENCE || valueType == Schema.DisplayType.ID);
+        Boolean isText = isReference
+            || valueType == Schema.DisplayType.STRING || valueType == Schema.DisplayType.PICKLIST
+            || valueType == Schema.DisplayType.EMAIL  || valueType == Schema.DisplayType.PHONE
+            || valueType == Schema.DisplayType.URL    || valueType == Schema.DisplayType.COMBOBOX;
+        Boolean askForListed = isText && !listed.isEmpty() && listed.size() <= 1000;
+
+        String fromWhere = ' FROM ' + rel.objectApiName + ' WHERE ' + String.join(conditions, ' AND ');
+        Set<String> found = new Set<String>();
+
+        if (askForListed) {
+            if (isReference) {
+                // a reference field can only be compared with real Ids; anything else cannot match
+                List<Id> ids = new List<Id>();
+                for (String v : listed) {
+                    try { ids.add(Id.valueOf(v)); } catch (Exception e) { /* not an Id - cannot match */ }
+                }
+                if (ids.isEmpty()) { return result; }
+                binds.put('listed', ids);
+            } else {
+                binds.put('listed', new List<String>(listed));
+            }
+            addValues(found, Database.queryWithBinds(
+                'SELECT ' + c.field + fromWhere + ' AND ' + c.field + ' IN :listed',
+                binds, AccessLevel.SYSTEM_MODE), c.field);
+
+        } else if (valueField.isGroupable()) {
+            // the distinct values, grouped in the query
+            String notEmpty = (valueType == Schema.DisplayType.BOOLEAN) ? '' : ' AND ' + c.field + ' != null';
+            for (SObject row : Database.queryWithBinds(
+                'SELECT ' + c.field + ' val' + fromWhere + notEmpty + ' GROUP BY ' + c.field,
+                binds, AccessLevel.SYSTEM_MODE)) {
+                Object v = row.get('val');
+                if (v != null) { found.add(String.valueOf(v)); }
+            }
+
+        } else {
+            addValues(found, Database.queryWithBinds(
+                'SELECT ' + c.field + fromWhere + ' LIMIT 2000',
+                binds, AccessLevel.SYSTEM_MODE), c.field);
+        }
+
+        result.addAll(found);
+        return result;
+    }
+
+    private static void addValues(Set<String> into, List<SObject> rows, String path) {
+        for (SObject row : rows) {
+            Object v = valueAt(row, path);
+            if (v != null) { into.add(String.valueOf(v)); }
+        }
+    }
+
+    /** The value of a field path such as Contact__r.MailingPostalCode in a queried row. */
+    public static Object valueAt(SObject row, String path) {
+        SObject current = row;
+        List<String> parts = path.split('\\.');
+        for (Integer i = 0; i < parts.size() - 1; i++) {
+            if (current == null) { return null; }
+            current = current.getSObject(parts[i]);
+        }
+        return (current == null) ? null : current.get(parts[parts.size() - 1]);
+    }
+}
