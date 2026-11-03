@@ -1,0 +1,174 @@
+import { LightningElement, api, wire } from 'lwc';
+import { getRecord } from 'lightning/uiRecordApi';
+import getRules from '@salesforce/apex/ContextualBannerController.getRules';
+import getRelatedValues from '@salesforce/apex/ContextualBannerController.getRelatedValues';
+
+/**
+ * contextualBannerAlert
+ *
+ * This component knows NO field name, NO object name and NO rule type.
+ * Every rule file says, in its "criteria", what to compare and how:
+ *
+ *   criteria.field        the field to compare
+ *   criteria.match        'equals' (default) - the value must equal an entry of the list
+ *                         'startsWith'       - the value must start with an entry of the list
+ *                         'id'               - record Ids: only the first 15 characters are
+ *                                              compared, so a 15 and an 18 character Id match
+ *   criteria.related      present when the field belongs to records LINKED to this one: Apex
+ *                         looks them up, one call per distinct kind of criterion
+ *   criteria.excludeField a field of this record; records whose value is in the rule's
+ *                         excludeRecords never show the banner
+ *
+ * Apex has already checked every name against the org's schema, so a new rule is a new
+ * file and needs no change here.
+ *
+ * A rule is judged on its own: a problem with one rule hides only that banner.
+ */
+const BANNER_CLASS =
+    'slds-notify slds-notify_alert slds-theme_alert-texture slds-theme_warning';
+
+export default class ContextualBannerAlert extends LightningElement {
+    @api recordId;
+    @api objectApiName;
+
+    ruleObject;         // object to load rules for
+    optionalFields;     // this record's fields that some rule compares - read when the user may see them
+    rules;              // every usable rule for this object, from Apex
+    fieldValues = {};   // this record's values read through Lightning Data Service
+    relatedValues = {}; // criteria.shape -> values of the linked records, from Apex
+
+    connectedCallback() {
+        this.ruleObject = this.objectApiName;   // Apex returns no rules for a page it does not serve
+    }
+
+    // One call returns the rules of every file for this object. The call takes
+    // no record Id, so the browser can reuse the result for every record.
+    @wire(getRules, { objectApiName: '$ruleObject' })
+    wiredRules({ data, error }) {
+        if (data) {
+            this.rules = data;
+
+            // the fields of this record that rules compare - optional, so a field the
+            // user cannot read never hides the other banners
+            const names = new Set();
+            data.forEach(rule => {
+                const c = rule.criteria;
+                if (!c) { return; }
+                if (!c.related) { names.add(c.field); }
+                if (c.excludeField) { names.add(c.excludeField); }
+            });
+            names.delete('Id');   // the record Id is already known
+            this.optionalFields = names.size
+                ? Array.from(names).map(f => this.objectApiName + '.' + f)
+                : undefined;
+
+            this.loadRelated(data);
+        } else if (error) {
+            this.logError(error, 'loading the rules');
+        }
+    }
+
+    // One Apex call for each distinct kind of related criterion - rules of the same kind
+    // share it - and only when such a rule exists.
+    loadRelated(rules) {
+        const firstOfKind = new Map();
+        rules.forEach(rule => {
+            const c = rule.criteria;
+            if (c && c.related && !firstOfKind.has(c.shape)) { firstOfKind.set(c.shape, rule.name); }
+        });
+
+        firstOfKind.forEach((ruleName, shape) => {
+            getRelatedValues({ recordId: this.recordId, ruleName })
+                .then(values => {
+                    this.relatedValues = { ...this.relatedValues, [shape]: values || [] };
+                })
+                .catch(error => this.logError(error, 'loading the linked records for ' + ruleName));
+        });
+    }
+
+    // Lightning Data Service - the record is already loaded for the page
+    @wire(getRecord, { recordId: '$recordId', optionalFields: '$optionalFields' })
+    wiredRecord({ data, error }) {
+        if (data) {
+            const values = {};
+            Object.keys(data.fields).forEach(name => {
+                values[name] = data.fields[name].value;
+            });
+            this.fieldValues = values;
+        } else if (error) {
+            this.logError(error, 'reading the record');
+        }
+    }
+
+    // The values a rule compares, as a list: the linked records' values, or this record's own
+    valuesOf(rule) {
+        const c = rule.criteria;
+        if (c.related) { return this.relatedValues[c.shape] || []; }
+        return this.ownValues(c.field);
+    }
+
+    ownValues(field) {
+        const value = field === 'Id' ? this.recordId : this.fieldValues[field];
+        return (value === undefined || value === null || value === '') ? [] : [value];
+    }
+
+    // True when the rule names this record in its optional excludeRecords list
+    isExcluded(rule) {
+        const field = rule.criteria.excludeField;
+        if (!field || !Array.isArray(rule.excludeRecords)) { return false; }
+
+        const excluded = rule.excludeRecords
+            .map(v => String(v).trim().toUpperCase())
+            .filter(v => v !== '');
+        return this.ownValues(field)
+            .map(v => String(v).trim().toUpperCase())
+            .some(value => excluded.includes(value));
+    }
+
+    // True when one of the record's values matches one of the rule's listed values
+    matches(rule) {
+        const c = rule.criteria;
+        if (!c || !Array.isArray(rule.policyRecords)) { return false; }
+
+        const startsWith = c.match === 'startsWith';
+        const normalise = v => {
+            const text = String(v).trim().toUpperCase();
+            return c.match === 'id' ? text.substring(0, 15) : text;
+        };
+        const listed = rule.policyRecords.map(normalise).filter(v => v !== '');
+        const exact = new Set(listed);
+
+        return this.valuesOf(rule)
+            .map(normalise)
+            .some(value => startsWith
+                ? listed.some(item => value.startsWith(item))
+                : exact.has(value));
+    }
+
+    /** The banners to show: every rule whose list matches a value of this record. */
+    get banners() {
+        if (!this.rules) { return []; }
+
+        return this.rules
+            .filter(rule => {
+                try {
+                    return this.matches(rule) && !this.isExcluded(rule);
+                } catch (error) {
+                    // a problem with one rule must not hide the others
+                    this.logError(error, 'checking ' + rule.name);
+                    return false;
+                }
+            })
+            .map(rule => ({
+                key: rule.name,
+                message: rule.message,
+                cssClass: BANNER_CLASS
+            }));
+    }
+
+    logError(error, doing) {
+        // a failure must never break the page - log the real message, show nothing
+        console.error('Contextual banner - problem ' + doing + ':',
+            (error && error.body && error.body.message) ? error.body.message : error);
+    }
+}
