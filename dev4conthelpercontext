@@ -1,0 +1,548 @@
+/**
+ * ContextualBannerHelper
+ *
+ * Reads the banner rules from static resources and checks them.
+ *
+ * ONE RULE PER FILE
+ *   Every static resource holds exactly one rule, so a mistake in one file
+ *   can never affect another rule. A bad file is skipped and logged.
+ *
+ *   {
+ *     "message": "text shown in the banner (HTML allowed)",
+ *     "description": "why the rule exists - never displayed",
+ *     "criteria": {
+ *       "field": "ProductName__c",              what to compare - a field on the page's record
+ *       "match": "equals"                       equals (default) | startsWith | id
+ *     },
+ *     "policyRecords": ["value1", "value2"],    the values to compare with
+ *     "excludeRecords": ["value3"]              optional - see criteria.excludeField
+ *   }
+ *
+ *   RELATED RECORDS - compare a field of records that are linked to the page's record:
+ *     "criteria": {
+ *       "related": {
+ *         "objectApiName": "PolicyContact__c",  the object that holds the links
+ *         "linkField": "Policy__c",             its lookup to the record on the page
+ *         "filters": [ { "field": "Role__c", "value": "Annuitant" } ]   optional, all must match
+ *       },
+ *       "field": "Contact__r.MailingPostalCode",   a field of those records, or a path through a lookup
+ *       "match": "startsWith"
+ *     }
+ *
+ *   A dotted path without "related" (for example "Account.Name" on the Contact page) is read
+ *   from the page's own record through a lookup.
+ *
+ *   "criteria.excludeField" (optional): a field on the page's record. Records whose value is
+ *   in excludeRecords never show the banner even when they match policyRecords.
+ *
+ * NO CODE CHANGE FOR A NEW RULE
+ *   Every object, field and link in "criteria" is checked here against the org's schema.
+ *   A rule that names something that does not exist, or uses a wrong match type, is
+ *   skipped and logged - it can never break another rule. The LWC and the controller never
+ *   mention a field name, so a new rule is a new file and nothing else.
+ *
+ * NAMING CONVENTION
+ *   Policy page   ->  CTX_POLICY_<anything>     Contact page  ->  CTX_CONTACT_<anything>
+ *   The first two words decide which page loads the file. Whatever follows is free text,
+ *   so a team's own rule name can be used. A file with any other name is ignored,
+ *   which is also how a rule is switched off (rename it, for example INACTIVE_CTX_...).
+ *
+ * OLD FILES
+ *   A file with no "criteria" is still understood if its name is one of the original
+ *   CTX_POLICY_<TYPE>_... / CTX_CONTACT_<TYPE>_... names (see legacyCriteria).
+ *
+ * SOQL COST
+ *   ONE query for all the files of an object, however many files there are.
+ */
+public with sharing class ContextualBannerHelper {
+
+    /** A condition on the linked records: the field must equal the value. */
+    public class Filter {
+        @AuraEnabled public String field;
+        @AuraEnabled public String value;
+    }
+
+    /** Where the linked records are: rows of objectApiName whose linkField points at the page's record. */
+    public class Related {
+        @AuraEnabled public String objectApiName;
+        @AuraEnabled public String linkField;
+        @AuraEnabled public List<Filter> filters;
+    }
+
+    /** What to compare, and how. */
+    public class Criteria {
+        @AuraEnabled public String field;
+        @AuraEnabled public String match;
+        @AuraEnabled public Related related;
+        @AuraEnabled public String excludeField;
+        @AuraEnabled public String shape;     // set here: rules with the same shape share one lookup
+    }
+
+    /** One rule = one file. What the LWC receives. */
+    public class Rule {
+        @AuraEnabled public String name;                 // static resource name - set here, not in the file
+        @AuraEnabled public String message;
+        @AuraEnabled public String description;
+        @AuraEnabled public List<String> policyRecords;
+        @AuraEnabled public List<String> excludeRecords; // optional - records that never show the banner
+        @AuraEnabled public Criteria criteria;
+    }
+
+    /** The name prefix decides which page a config file belongs to. */
+    public static final String POLICY_PREFIX  = 'CTX_POLICY_';
+    public static final String CONTACT_PREFIX = 'CTX_CONTACT_';
+
+    private static final Set<String> MATCH_TYPES = new Set<String>{ 'equals', 'startswith', 'id' };
+
+    // field types that cannot be compared as text
+    private static final Set<Schema.DisplayType> UNSUPPORTED_TYPES = new Set<Schema.DisplayType>{
+        Schema.DisplayType.ADDRESS, Schema.DisplayType.ANYTYPE, Schema.DisplayType.BASE64,
+        Schema.DisplayType.COMPLEXVALUE, Schema.DisplayType.DATACATEGORYGROUPREFERENCE,
+        Schema.DisplayType.ENCRYPTEDSTRING, Schema.DisplayType.LOCATION
+    };
+
+    /** The object a page belongs to -> the file name prefix for that page. Null = no rules. */
+    public static String prefixFor(String objectApiName) {
+        if (objectApiName == 'PolicyMaster__c') { return POLICY_PREFIX; }
+        if (objectApiName == 'Contact')         { return CONTACT_PREFIX; }
+        return null;
+    }
+
+    /** Rules for PolicyMaster__c pages - every CTX_POLICY_* file, read with ONE query. */
+    public static List<Rule> getPolicyRules() {
+        return getRulesFor('PolicyMaster__c');
+    }
+
+    /** Rules for Contact pages - reads ONLY the CTX_CONTACT_* files. */
+    public static List<Rule> getContactRules() {
+        return getRulesFor('Contact');
+    }
+
+    /**
+     * The usable rules of a page: the files are read with ONE query, then each rule's
+     * criteria is checked against the schema. A rule that fails is left out and logged.
+     */
+    public static List<Rule> getRulesFor(String objectApiName) {
+        List<Rule> usable = new List<Rule>();
+        String prefix = prefixFor(objectApiName);
+        if (prefix == null) { return usable; }
+
+        for (Rule r : loadRules(prefix)) {
+            if (prepare(r, objectApiName)) { usable.add(r); }
+        }
+        return usable;
+    }
+
+    // ------------------------------------------------------------- reading the files
+
+    /**
+     * Loads every rule whose static resource name starts with the prefix.
+     * ONE SOQL query. A bad file is skipped and logged, never fatal.
+     */
+    public static List<Rule> loadRules(String prefix) {
+        return loadRules(new List<String>{ prefix });
+    }
+
+    /** Same, for two prefixes - still ONE query. */
+    public static List<Rule> loadRules(String prefix, String otherPrefix) {
+        return loadRules(new List<String>{ prefix, otherPrefix });
+    }
+
+    /** Same, for three prefixes - still ONE query. */
+    public static List<Rule> loadRules(String prefix, String otherPrefix, String thirdPrefix) {
+        return loadRules(new List<String>{ prefix, otherPrefix, thirdPrefix });
+    }
+
+    /**
+     * Same, for any number of prefixes - still ONE query. If any prefix is
+     * blank nothing is looked up.
+     */
+    public static List<Rule> loadRules(List<String> prefixes) {
+
+        List<Rule> rules = new List<Rule>();
+        if (prefixes == null || prefixes.isEmpty()) { return rules; }
+
+        // one LIKE condition per prefix, each with its own bind variable
+        List<String> conditions = new List<String>();
+        Map<String, Object> binds = new Map<String, Object>();
+        for (Integer i = 0; i < prefixes.size(); i++) {
+            if (String.isBlank(prefixes[i])) { return rules; }
+            conditions.add('Name LIKE :p' + i);
+            binds.put('p' + i, prefixes[i] + '%');
+        }
+
+        List<StaticResource> files = Database.queryWithBinds(
+            'SELECT Name, Body FROM StaticResource WHERE '
+                + String.join(conditions, ' OR ') + ' ORDER BY Name',
+            binds,
+            AccessLevel.SYSTEM_MODE
+        );
+
+        for (StaticResource file : files) {
+            // in LIKE an underscore matches any single character, so confirm
+            // the name really starts with one of the prefixes
+            Boolean wanted = false;
+            for (String prefix : prefixes) {
+                if (file.Name.startsWithIgnoreCase(prefix)) { wanted = true; break; }
+            }
+            if (!wanted) { continue; }
+
+            String raw = (file.Body == null) ? null : file.Body.toString();
+            Rule r = parseRule(file.Name, raw);
+            if (r != null) { rules.add(r); }
+        }
+
+        System.debug('ContextualBanner - ' + rules.size() + ' valid rule(s) from '
+            + files.size() + ' file(s) matching ' + String.join(prefixes, '%, ') + '%');
+
+        return rules;
+    }
+
+    /**
+     * Turns the text of one file into a Rule, or returns null (and logs why)
+     * if the file cannot be used.
+     */
+    public static Rule parseRule(String fileName, String raw) {
+
+        if (String.isBlank(raw)) {
+            logSkip(fileName, 'the file is empty');
+            return null;
+        }
+
+        // an editor may add a byte order mark, which breaks JSON.deserialize
+        String bom = String.fromCharArray(new List<Integer>{ 65279 });
+        String text = raw;
+        if (text.startsWith(bom)) { text = text.substring(1); }
+
+        Rule r;
+        try {
+            r = (Rule) JSON.deserialize(text, Rule.class);
+        } catch (Exception e) {
+            // also catches the old format, where a file held an array of rules
+            logSkip(fileName, 'not valid JSON for a single rule - ' + e.getMessage());
+            return null;
+        }
+
+        if (r == null || String.isBlank(r.message)) {
+            logSkip(fileName, '"message" is missing or blank');
+            return null;
+        }
+        if (r.policyRecords == null || r.policyRecords.isEmpty()) {
+            logSkip(fileName, '"policyRecords" is missing or empty');
+            return null;
+        }
+
+        r.name = fileName;
+        return r;
+    }
+
+    // ------------------------------------------------------------ checking the criteria
+
+    /**
+     * Checks the rule's criteria against the schema and fills in what is implied
+     * (default match type, a lookup for a dotted path, the canonical spelling of every
+     * name, the shape). Returns false - and logs why - when the rule cannot be used.
+     * pageObject is the object of the page the rule is loaded for.
+     */
+    public static Boolean prepare(Rule r, String pageObject) {
+
+        Criteria c = r.criteria;
+        if (c == null) { c = legacyCriteria(r.name); }
+        if (c == null) {
+            logSkip(r.name, 'the file has no "criteria" and its name is not one of the original '
+                + 'CTX_<PAGE>_<TYPE>_ names');
+            return false;
+        }
+        r.criteria = c;
+        c.shape = null;
+
+        // how to compare
+        String match = String.isBlank(c.match) ? 'equals' : c.match.trim().toLowerCase();
+        if (!MATCH_TYPES.contains(match)) {
+            logSkip(r.name, '"match" must be equals, startsWith or id, not "' + c.match + '"');
+            return false;
+        }
+        c.match = (match == 'startswith') ? 'startsWith' : match;
+
+        if (String.isBlank(c.field)) {
+            logSkip(r.name, '"criteria.field" is missing');
+            return false;
+        }
+        String field = c.field.trim();
+
+        // a dotted path on the page's own record is read through a lookup of the record itself
+        if (c.related == null && field.contains('.')) {
+            c.related = new Related();
+            c.related.objectApiName = pageObject;
+            c.related.linkField = 'Id';
+        }
+
+        String sourceObject = pageObject;     // the object the field belongs to
+        String shapeSource = 'SELF';
+
+        if (c.related != null) {
+            Related rel = c.related;
+            if (String.isBlank(rel.objectApiName) || String.isBlank(rel.linkField)) {
+                logSkip(r.name, '"related" needs "objectApiName" and "linkField"');
+                return false;
+            }
+            Schema.DescribeSObjectResult relObject = describe(rel.objectApiName.trim());
+            if (relObject == null) {
+                logSkip(r.name, 'related object "' + rel.objectApiName + '" does not exist');
+                return false;
+            }
+            rel.objectApiName = relObject.getName();
+
+            // the link must be a lookup to the page's object (or the record's own Id)
+            if (rel.linkField.contains('.')) {
+                logSkip(r.name, '"linkField" must be a single field, not a path');
+                return false;
+            }
+            PathResult link = resolvePath(rel.objectApiName, rel.linkField);
+            if (link.path == null) {
+                logSkip(r.name, 'linkField: ' + link.why);
+                return false;
+            }
+            Schema.DisplayType linkType = link.last.getType();
+            Boolean linkOk = false;
+            if (linkType == Schema.DisplayType.REFERENCE) {
+                for (Schema.SObjectType target : link.last.getReferenceTo()) {
+                    if (String.valueOf(target).equalsIgnoreCase(pageObject)) { linkOk = true; }
+                }
+            } else if (linkType == Schema.DisplayType.ID) {
+                linkOk = rel.objectApiName.equalsIgnoreCase(pageObject);
+            }
+            if (!linkOk) {
+                logSkip(r.name, 'linkField ' + rel.objectApiName + '.' + link.path
+                    + ' is not a lookup to ' + pageObject);
+                return false;
+            }
+            rel.linkField = link.path;
+
+            // optional conditions on the linked records
+            if (rel.filters == null) { rel.filters = new List<Filter>(); }
+            List<String> filterKeys = new List<String>();
+            for (Filter f : rel.filters) {
+                if (f == null || String.isBlank(f.field) || f.value == null || f.field.contains('.')) {
+                    logSkip(r.name, 'each filter needs a single "field" and a "value"');
+                    return false;
+                }
+                PathResult fr = resolvePath(rel.objectApiName, f.field);
+                if (fr.path == null) {
+                    logSkip(r.name, 'filter: ' + fr.why);
+                    return false;
+                }
+                f.field = fr.path;
+                filterKeys.add(f.field.toLowerCase() + '=' + f.value);
+            }
+            filterKeys.sort();
+
+            sourceObject = rel.objectApiName;
+            shapeSource = 'REL|' + sourceObject.toLowerCase() + '|' + rel.linkField.toLowerCase()
+                + '|' + String.join(filterKeys, '&');
+        }
+
+        // the compared field itself
+        PathResult value = resolvePath(sourceObject, field);
+        if (value.path == null) {
+            logSkip(r.name, 'criteria.field: ' + value.why);
+            return false;
+        }
+        c.field = value.path;
+        c.shape = shapeSource + '|' + c.field.toLowerCase();
+
+        // the optional exclusion field - always on the page's own record
+        if (!String.isBlank(c.excludeField)) {
+            if (c.excludeField.contains('.')) {
+                logSkip(r.name, '"excludeField" must be a single field of the page\'s record');
+                return false;
+            }
+            PathResult ex = resolvePath(pageObject, c.excludeField);
+            if (ex.path == null) {
+                logSkip(r.name, 'excludeField: ' + ex.why);
+                return false;
+            }
+            c.excludeField = ex.path;
+        } else {
+            c.excludeField = null;
+        }
+        return true;
+    }
+
+    /**
+     * What the original file names meant, for files that have no "criteria".
+     * Null when the name is not one of them.
+     */
+    public static Criteria legacyCriteria(String fileName) {
+        if (fileName == null) { return null; }
+        String n = fileName.toUpperCase();
+
+        // ---- Policy page
+        if (n.startsWith('CTX_POLICY_POLICYNUMBER_')) { return ownField('PolicyNumber__c', 'equals', null); }
+        if (n.startsWith('CTX_POLICY_POLICYGROUP_'))  { return ownField('PolicyGroup__c', 'equals', null); }
+        if (n.startsWith('CTX_POLICY_PRODUCT_'))      { return ownField('ProductName__c', 'equals', null); }
+        if (n.startsWith('CTX_POLICY_SYSTEMCODE_'))   { return ownField('SystemCode__c', 'equals', null); }
+        if (n.startsWith('CTX_POLICY_AGENCY_'))       { return ownField('AgencyNumber__c', 'equals', 'Name'); }
+        if (n.startsWith('CTX_POLICY_POSTCODE_')) {
+            return linked('PolicyContact__c', 'Policy__c', 'Contact__r.MailingPostalCode', 'startsWith', null);
+        }
+        if (n.startsWith('CTX_POLICY_CONTACTNAME_')) {
+            return linked('PolicyContact__c', 'Policy__c', 'Contact__r.Name', 'equals', null);
+        }
+
+        // ---- Contact page
+        if (n.startsWith('CTX_CONTACT_GLOBALAGENT_'))  { return ownField('Global_Agent_ID__c', 'equals', null); }
+        if (n.startsWith('CTX_CONTACT_LSWAGENT_'))     { return ownField('LSW_Life_Agent_Number__c', 'equals', null); }
+        if (n.startsWith('CTX_CONTACT_POSTCODE_'))     { return ownField('MailingPostalCode', 'startsWith', null); }
+        if (n.startsWith('CTX_CONTACT_CONTACTNAME_'))  { return ownField('Name', 'equals', null); }
+        if (n.startsWith('CTX_CONTACT_PARTYID_'))      { return ownField('PartyIdentifier__c', 'equals', null); }
+        if (n.startsWith('CTX_CONTACT_EMAILBOUNCED_')) { return ownField('IsEmailBounced', 'equals', null); }
+        if (n.startsWith('CTX_CONTACT_ACCOUNT_'))      { return ownField('AccountId', 'id', null); }
+        if (n.startsWith('CTX_CONTACT_ID_'))           { return ownField('Id', 'id', null); }
+        if (n.startsWith('CTX_CONTACT_POLICYGROUP_')) {
+            return linked('PolicyContact__c', 'Contact__c', 'Policy__r.PolicyGroup__c', 'equals', null);
+        }
+        if (n.startsWith('CTX_CONTACT_POLICYNUMBER_')) {
+            return linked('PolicyContact__c', 'Contact__c', 'Policy__r.PolicyNumber__c', 'equals', null);
+        }
+        if (n.startsWith('CTX_CONTACT_ANNUITANT_')) {
+            Filter role = new Filter();
+            role.field = 'Role__c';
+            role.value = 'Annuitant';
+            return linked('PolicyContact__c', 'Contact__c', 'Policy__c', 'id', role);
+        }
+        return null;
+    }
+
+    private static Criteria ownField(String field, String match, String excludeField) {
+        Criteria c = new Criteria();
+        c.field = field;
+        c.match = match;
+        c.excludeField = excludeField;
+        return c;
+    }
+
+    private static Criteria linked(String objectName, String linkField, String field,
+                                   String match, Filter filter) {
+        Criteria c = new Criteria();
+        c.field = field;
+        c.match = match;
+        c.related = new Related();
+        c.related.objectApiName = objectName;
+        c.related.linkField = linkField;
+        c.related.filters = new List<Filter>();
+        if (filter != null) { c.related.filters.add(filter); }
+        return c;
+    }
+
+    // ------------------------------------------------------------------ schema checks
+
+    /** The result of walking a field path through the schema. */
+    public class PathResult {
+        public String path;                        // canonical spelling, null when the path is not usable
+        public Schema.DescribeFieldResult last;    // the final field
+        public String why;                         // the reason when path is null
+    }
+
+    private static Map<String, Schema.DescribeSObjectResult> objectCache =
+        new Map<String, Schema.DescribeSObjectResult>();
+
+    /** The describe of an object, or null when the object does not exist. */
+    public static Schema.DescribeSObjectResult describe(String objectName) {
+        if (String.isBlank(objectName)) { return null; }
+        String key = objectName.trim().toLowerCase();
+        if (!objectCache.containsKey(key)) {
+            Schema.DescribeSObjectResult d = null;
+            try {
+                d = Schema.describeSObjects(new List<String>{ objectName.trim() })[0];
+            } catch (Exception e) {
+                d = null;
+            }
+            objectCache.put(key, d);
+        }
+        return objectCache.get(key);
+    }
+
+    /**
+     * Walks a field path such as Contact__r.MailingPostalCode or Account.Name from an
+     * object, checking every step exists. Returns the canonical spelling of the path.
+     */
+    public static PathResult resolvePath(String objectName, String path) {
+        PathResult res = new PathResult();
+        if (String.isBlank(path)) { res.why = 'the field name is blank'; return res; }
+
+        List<String> parts = path.trim().split('\\.');
+        List<String> canonical = new List<String>();
+        String current = objectName;
+
+        for (Integer i = 0; i < parts.size(); i++) {
+            Schema.DescribeSObjectResult d = describe(current);
+            if (d == null) { res.why = 'object "' + current + '" does not exist'; return res; }
+            Map<String, Schema.SObjectField> fields = d.fields.getMap();
+            String part = parts[i].trim();
+
+            if (i < parts.size() - 1) {
+                // a relationship name: Contact__r for a custom lookup, Account for AccountId
+                Schema.DescribeFieldResult hop = lookupFor(d, part);
+                if (hop == null) {
+                    res.why = '"' + part + '" is not a lookup relationship of ' + d.getName();
+                    return res;
+                }
+                canonical.add(hop.getRelationshipName());
+                current = String.valueOf(hop.getReferenceTo()[0]);
+            } else {
+                Schema.SObjectField f = fields.get(part.toLowerCase());
+                if (f == null) {
+                    res.why = 'field "' + part + '" does not exist on ' + d.getName();
+                    return res;
+                }
+                Schema.DescribeFieldResult fd = f.getDescribe();
+                if (UNSUPPORTED_TYPES.contains(fd.getType())) {
+                    res.why = 'field ' + d.getName() + '.' + fd.getName() + ' is of a type that cannot be compared';
+                    return res;
+                }
+                canonical.add(fd.getName());
+                res.last = fd;
+            }
+        }
+        res.path = String.join(canonical, '.');
+        return res;
+    }
+
+    /** The lookup field behind a relationship name, or null. */
+    private static Schema.DescribeFieldResult lookupFor(Schema.DescribeSObjectResult d, String relationship) {
+        Map<String, Schema.SObjectField> fields = d.fields.getMap();
+
+        // fast path: Contact__r -> Contact__c, Account -> AccountId
+        String guess = relationship.toLowerCase().endsWith('__r')
+            ? relationship.substring(0, relationship.length() - 1) + 'c'
+            : relationship + 'Id';
+        Schema.SObjectField direct = fields.get(guess.toLowerCase());
+        if (direct != null) {
+            Schema.DescribeFieldResult fd = direct.getDescribe();
+            if (fd.getRelationshipName() != null && fd.getRelationshipName().equalsIgnoreCase(relationship)
+                && !fd.getReferenceTo().isEmpty()) {
+                return fd;
+            }
+        }
+        // slow path: any field whose relationship name matches
+        for (Schema.SObjectField f : fields.values()) {
+            Schema.DescribeFieldResult fd = f.getDescribe();
+            if (fd.getRelationshipName() != null && fd.getRelationshipName().equalsIgnoreCase(relationship)
+                && !fd.getReferenceTo().isEmpty()) {
+                return fd;
+            }
+        }
+        return null;
+    }
+
+    /** The describe of the last field of a path, or null if the path is not usable. */
+    public static Schema.DescribeFieldResult fieldInfo(String objectName, String path) {
+        return resolvePath(objectName, path).last;
+    }
+
+    private static void logSkip(String fileName, String reason) {
+        System.debug(LoggingLevel.ERROR,
+            'ContextualBanner - skipped ' + fileName + ': ' + reason);
+    }
+}
