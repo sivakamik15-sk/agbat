@@ -1,0 +1,11 @@
+{
+  "message": "TEST - policy number is in the list",
+  "description": "Policy's own field PolicyNumber__c. Replace the value with the policy number of a dev policy. No related block - the field is on the policy itself.",
+  "criteria": {
+    "field": "PolicyNumber__c",
+    "match": "equals"
+  },
+  "policyRecords": [
+    "REPLACE_WITH_A_POLICY_NUMBER"
+  ]
+}
