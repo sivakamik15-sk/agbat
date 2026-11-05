@@ -1,0 +1,223 @@
+# verify-prod-files.ps1  -  the second check: do the FILES say exactly what the WORKBOOK says?
+#
+# It does NOT use the converter. It reads the workbook again (same two sheets: 1 = policy rules,
+# 2 = contact rules) and the rule files (.json) in a folder, and compares, rule by rule:
+#
+#   1. there is a file for every rule of the sheet (the name: CTX_POLICY_ / CTX_CONTACT_ + DeveloperName)
+#   2. there is no file that no rule of the sheet asks for
+#   3. the message in the file is character for character the content of the sheet
+#   4. the values in the file are exactly the quoted values of the query (count, text, spelling, duplicates)
+#   5. the file is valid JSON, names a field to compare, and has its .resource-meta.xml
+#
+# It changes nothing. It says one sentence at the end: MATCH or NOT MATCHED.
+#
+# The folder can be the one the converter made (prod static resource files) - or a folder you RETRIEVED
+# from Salesforce, to prove that what is in the org is what the sheet says.
+#
+#   .\verify-prod-files.ps1 -Workbook "C:\path\rules.xlsx"
+#   .\verify-prod-files.ps1 -Workbook "C:\path\rules.xlsx" -FilesFolder "C:\path\to\the\files"
+
+param(
+    [string]$Workbook    = '',
+    [string]$FilesFolder = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'prod static resource files')
+)
+
+$ErrorActionPreference = 'Stop'
+if (-not $Workbook) { $Workbook = (Read-Host 'Path of the workbook (.xlsx)').Trim().Trim('"').Trim() }
+if (-not (Test-Path -LiteralPath $Workbook -PathType Leaf)) { throw "Workbook not found: $Workbook" }
+if (-not (Test-Path -LiteralPath $FilesFolder -PathType Container)) { throw "Folder not found: $FilesFolder" }
+
+$problems = New-Object System.Collections.Generic.List[object]
+function Problem([string]$kind, [string]$file, [string]$row, [string]$detail) {
+    $problems.Add([pscustomobject]@{ Problem = $kind; File = $file; WorkbookRow = $row; Detail = $detail })
+}
+
+function Safe-Name([string]$s) {
+    $t = ($s -replace '[^A-Za-z0-9]+', '_').Trim('_')
+    if ($t -eq '') { return '' }
+    if ($t -notmatch '^[A-Za-z]') { $t = 'R_' + $t }
+    return $t
+}
+
+# ------------------------------------------------------------------ read the two sheets, cell by cell
+$tmpFiles = @()
+$excel = $null
+$sheets = @()
+try {
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false; $excel.DisplayAlerts = $false
+    $wb = $excel.Workbooks.Open($Workbook, 0, $true)
+    if ($wb.Worksheets.Count -lt 2) { throw "The workbook has $($wb.Worksheets.Count) sheet(s). It needs 2: policy rules, contact rules." }
+    foreach ($i in 1..2) {
+        $ws = $wb.Worksheets.Item($i)
+        $ur = $ws.UsedRange
+        $nr = $ur.Rows.Count; $nc = $ur.Columns.Count
+        $vals = $ur.Value2
+        $grid = New-Object System.Collections.Generic.List[object]
+        for ($r = 1; $r -le $nr; $r++) {
+            $line = New-Object 'string[]' $nc
+            for ($c = 1; $c -le $nc; $c++) {
+                $v = if ($nr -eq 1 -and $nc -eq 1) { $vals } else { $vals[$r, $c] }
+                if ($null -eq $v) { $line[$c - 1] = '' }
+                elseif ($v -is [string]) { $line[$c - 1] = $v }
+                else { $line[$c - 1] = [string]$ur.Cells.Item($r, $c).Text }
+            }
+            $grid.Add($line)
+        }
+        $sheets += [pscustomobject]@{ Name = $ws.Name; Grid = $grid }
+    }
+    $wb.Close($false)
+} finally {
+    if ($excel) { $excel.Quit(); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+}
+
+function Col-Index($header, [string]$pattern) {
+    for ($k = 0; $k -lt $header.Length; $k++) { if ($header[$k] -match $pattern) { return $k } }
+    return -1
+}
+
+# ------------------------------------------------------------------ the files in the folder
+$jsonFiles = @{}
+foreach ($f in @(Get-ChildItem -LiteralPath $FilesFolder -Recurse -File -Filter '*.json')) {
+    if ($f.FullName -match '[\\/]reports[\\/]') { continue }
+    $key = $f.BaseName.ToUpper()
+    if ($jsonFiles.ContainsKey($key)) { Problem 'duplicate file' $f.BaseName '' "the name appears twice in the folder: $($jsonFiles[$key].FullName) and $($f.FullName)" }
+    else { $jsonFiles[$key] = $f }
+}
+$claimed = New-Object 'System.Collections.Generic.HashSet[string]'
+
+# ------------------------------------------------------------------ rule by rule
+$ruleCount = @{ policy = 0; contact = 0 }
+$sheetValues = 0; $fileValues = 0
+$pageNames = @('policy', 'contact')
+
+for ($s = 0; $s -lt 2; $s++) {
+    $page = $pageNames[$s]
+    $prefix = if ($page -eq 'policy') { 'CTX_POLICY_' } else { 'CTX_CONTACT_' }
+    $grid = $sheets[$s].Grid
+    if ($grid.Count -lt 2) { Problem 'empty sheet' '' '' "sheet '$($sheets[$s].Name)' has no rule rows"; continue }
+    $header = $grid[0]
+    $qi = Col-Index $header '(?i)query'
+    $ci = Col-Index $header '(?i)^content'
+    if ($ci -lt 0) { $ci = Col-Index $header '(?i)content|message' }
+    $ni = Col-Index $header '(?i)developername'
+    $ai = Col-Index $header '(?i)active'
+    if ($qi -lt 0 -or $ci -lt 0 -or $ni -lt 0) {
+        throw "Sheet '$($sheets[$s].Name)': needs a query, a content and a DeveloperName column. Columns found: $($header -join ', ')"
+    }
+
+    # which rows are rules, and how many share a DeveloperName
+    $active = @()
+    $count = @{}
+    for ($r = 1; $r -lt $grid.Count; $r++) {
+        $row = $grid[$r]
+        if (($row -join '').Trim() -eq '') { continue }                  # an empty line
+        if ($ai -ge 0) { $v = $row[$ai].Trim(); if ($v -ne '' -and $v -notmatch '^(?i:true|1|yes)$') { continue } }
+        $active += $r
+        $sn = (Safe-Name $row[$ni]).ToUpper()
+        if ($sn -ne '') { if ($count.ContainsKey($sn)) { $count[$sn]++ } else { $count[$sn] = 1 } }
+    }
+
+    $used = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in $active) {
+        $row = $grid[$r]
+        $rowNo = $r + 1
+        $ruleCount[$page]++
+        $dev = Safe-Name $row[$ni]
+        if ($dev -eq '') { Problem 'no file name' '' "$page row $rowNo" 'the DeveloperName is empty'; continue }
+        $maxLen = 80 - $prefix.Length - 4
+        if ($dev.Length -gt $maxLen) { $dev = $dev.Substring(0, $maxLen).TrimEnd('_') }
+        $base = $prefix + $dev
+        if ($count[(Safe-Name $row[$ni]).ToUpper()] -le 1 -and -not $used.Contains($base.ToUpper())) { $name = $base }
+        else { $n = 1; do { $name = '{0}_{1:D3}' -f $base, $n; $n++ } while ($used.Contains($name.ToUpper())) }
+        [void]$used.Add($name.ToUpper())
+
+        # the values of the query: every quoted text, read by one simple scan of the whole query
+        $q = $row[$qi] -replace "\\'", "'"
+        $expectedValues = New-Object System.Collections.Generic.List[string]
+        foreach ($m in [regex]::Matches($q, "'((?:[^']|'')*)'")) {
+            $text = $m.Groups[1].Value -replace "''", "'"
+            $before = $q.Substring([Math]::Max(0, $m.Index - 12), [Math]::Min(12, $m.Index))
+            if ($before -match '(?i)like\s*$') { $text = $text.TrimEnd('%') }
+            $expectedValues.Add($text)
+        }
+        if ($q -match "(?i)role__c\s*=\s*'Annuitant'") {          # the role is a condition, not a value of the list
+            for ($k = 0; $k -lt $expectedValues.Count; $k++) { if ($expectedValues[$k] -ceq 'Annuitant') { $expectedValues.RemoveAt($k); break } }
+        }
+        if ($expectedValues.Count -eq 0 -and $q -match '(?i)isemailbounced\s*=\s*true') { $expectedValues.Add('true') }
+        $sheetValues += $expectedValues.Count
+
+        # the file
+        $key = $name.ToUpper()
+        if (-not $jsonFiles.ContainsKey($key)) { Problem 'MISSING file' $name "$page row $rowNo" 'the sheet has this rule but there is no file with this name'; continue }
+        $fileInfo = $jsonFiles[$key]
+        [void]$claimed.Add($key)
+
+        if ($fileInfo.BaseName -cne $name) { Problem 'file name differs' $fileInfo.BaseName "$page row $rowNo" "the name should be exactly $name" }
+        $metaPath = Join-Path $fileInfo.DirectoryName ($fileInfo.BaseName + '.resource-meta.xml')
+        if (-not (Test-Path -LiteralPath $metaPath)) { Problem 'no meta file' $name "$page row $rowNo" "$($fileInfo.BaseName).resource-meta.xml is missing next to the json" }
+        elseif ((Get-Content -LiteralPath $metaPath -Raw) -notmatch 'application/json') { Problem 'meta file' $name "$page row $rowNo" 'the meta file does not say application/json' }
+
+        try { $obj = Get-Content -LiteralPath $fileInfo.FullName -Raw -Encoding UTF8 | ConvertFrom-Json }
+        catch { Problem 'invalid JSON' $name "$page row $rowNo" $_.Exception.Message; continue }
+
+        # 3. the message, character for character
+        if ([string]$obj.message -cne $row[$ci]) {
+            Problem 'MESSAGE differs' $name "$page row $rowNo" ("sheet: [" + $row[$ci] + "]   file: [" + [string]$obj.message + "]")
+        }
+
+        # 4. the values
+        $inFile = New-Object System.Collections.Generic.List[string]
+        foreach ($x in @($obj.policyRecords)) { $inFile.Add([string]$x) }
+        $exclFile = New-Object System.Collections.Generic.List[string]
+        if ($obj.PSObject.Properties.Name -contains 'excludeRecords') { foreach ($x in @($obj.excludeRecords)) { $exclFile.Add([string]$x) } }
+        $all = New-Object System.Collections.Generic.List[string]
+        $all.AddRange($inFile); $all.AddRange($exclFile)
+        $fileValues += $all.Count
+
+        $a = [string[]]$expectedValues.ToArray(); [Array]::Sort($a, [StringComparer]::Ordinal)
+        $b = [string[]]$all.ToArray();            [Array]::Sort($b, [StringComparer]::Ordinal)
+        if ($a.Length -ne $b.Length) {
+            Problem 'VALUE COUNT differs' $name "$page row $rowNo" "query has $($a.Length) value(s), file has $($b.Length)"
+        } else {
+            for ($k = 0; $k -lt $a.Length; $k++) {
+                if ($a[$k] -cne $b[$k]) { Problem 'VALUE differs' $name "$page row $rowNo" "query value [$($a[$k])] is not matched by file value [$($b[$k])]"; break }
+            }
+        }
+
+        # 5. the file can be used by the code
+        if ($null -eq $obj.criteria -or [string]::IsNullOrWhiteSpace([string]$obj.criteria.field)) {
+            Problem 'no criteria' $name "$page row $rowNo" 'the file has no criteria.field - the banner code would skip it'
+        }
+    }
+}
+
+# 2. files that no rule asks for
+foreach ($key in $jsonFiles.Keys) {
+    if (-not $claimed.Contains($key)) {
+        Problem 'EXTRA file' $jsonFiles[$key].BaseName '' 'this file is in the folder but no rule of the sheet gives this name'
+    }
+}
+
+# ------------------------------------------------------------------ the answer
+$reportDir = Join-Path $FilesFolder 'reports'
+if (-not (Test-Path -LiteralPath $reportDir)) { $reportDir = $FilesFolder }
+$reportPath = Join-Path $reportDir 'VERIFY-REPORT.csv'
+$totalRules = $ruleCount.policy + $ruleCount.contact
+
+Write-Host ''
+Write-Host "Sheet rules : policy $($ruleCount.policy), contact $($ruleCount.contact), total $totalRules"
+Write-Host "Files found : $($jsonFiles.Count)"
+Write-Host "Values      : in the queries $sheetValues, in the files $fileValues"
+
+if ($problems.Count -eq 0 -and $jsonFiles.Count -eq $totalRules -and $sheetValues -eq $fileValues) {
+    [pscustomobject]@{ Result = 'MATCH' } | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+    Write-Host ''
+    Write-Host "RESULT: MATCH - all $totalRules rules (policy $($ruleCount.policy), contact $($ruleCount.contact)) are in the files: every message, every value and every file name is exactly the same as the sheet. Nothing missed, nothing extra." -ForegroundColor Green
+} else {
+    $problems | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+    Write-Host ''
+    Write-Host "RESULT: NOT MATCHED - $($problems.Count) problem(s). Details: $reportPath" -ForegroundColor Red
+    foreach ($p in ($problems | Select-Object -First 15)) { Write-Host ("   {0,-20} {1,-45} {2}" -f $p.Problem, $p.File, $p.Detail) -ForegroundColor Yellow }
+    if ($problems.Count -gt 15) { Write-Host "   ... and $($problems.Count - 15) more in the report" -ForegroundColor Yellow }
+}
