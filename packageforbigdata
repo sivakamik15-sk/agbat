@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    <types>
+        <members>Read Only Custom</members>
+        <name>Profile</name>
+    </types>
+    <types>
+        <members>Read Only Custom</members>
+        <name>ProfileSessionSetting</name>
+    </types>
+    <types>
+        <members>Read Only Custom</members>
+        <name>ProfilePasswordPolicy</name>
+    </types>
+    <types>
+        <members>Soap API Connection PS</members>
+        <name>PermissionSet</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>CustomObject</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>ApexClass</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>ApexPage</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>CustomApplication</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>CustomPermission</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>Flow</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>ConnectedApp</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>ExternalDataSource</name>
+    </types>
+    <types>
+        <members>*</members>
+        <name>NamedCredential</name>
+    </types>
+    <version>67.0</version>
+</Package>
