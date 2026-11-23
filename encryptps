@@ -1,0 +1,86 @@
+# encrypt-creds.ps1
+# Encrypts clientId and clientSecret inside clientcreds.json with AES-256 (CBC, random IV per value).
+# - No DPAPI, no Windows certificate, no extra software. Uses the .NET Aes class built into Windows PowerShell 5.1.
+# - The AES key is saved in a SEPARATE file (default C:\NLG\Keys\aes.key). Lock that folder with NTFS permissions.
+# - Values that already start with "aes:" are skipped, so it is safe to re-run.
+# - To renew a secret: put the NEW plain value in clientcreds.json, then run this again.
+# - Nothing secret is printed. Each value is decrypted again to prove it round-trips BEFORE the file is rewritten.
+param(
+  [string]$CredsFile = 'C:\NLG\Config\clientcreds.json',
+  [string]$KeyFile   = 'C:\NLG\Keys\aes.key'
+)
+$ErrorActionPreference = 'Stop'
+
+function Protect-Value([string]$plain, [byte[]]$key) {
+  $aes = [Security.Cryptography.Aes]::Create()
+  $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $key; $aes.GenerateIV()
+  $bytes = [Text.Encoding]::UTF8.GetBytes($plain)
+  $ct = $aes.CreateEncryptor().TransformFinalBlock($bytes, 0, $bytes.Length)
+  $out = New-Object byte[] ($aes.IV.Length + $ct.Length)
+  [Array]::Copy($aes.IV, 0, $out, 0, $aes.IV.Length)
+  [Array]::Copy($ct, 0, $out, $aes.IV.Length, $ct.Length)
+  $aes.Dispose()
+  return 'aes:' + [Convert]::ToBase64String($out)
+}
+
+function Unprotect-Value([string]$stored, [byte[]]$key) {
+  $all = [Convert]::FromBase64String($stored.Substring(4))
+  $aes = [Security.Cryptography.Aes]::Create()
+  $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $key
+  $aes.IV = $all[0..15]
+  $ct = $all[16..($all.Length - 1)]
+  $pt = $aes.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
+  $aes.Dispose()
+  return [Text.Encoding]::UTF8.GetString($pt)
+}
+
+try {
+  if (-not (Test-Path -LiteralPath $CredsFile)) { throw "credentials file not found: $CredsFile" }
+
+  # ---- key: reuse if present, else create ----
+  if (Test-Path -LiteralPath $KeyFile) {
+    $key = [Convert]::FromBase64String((Get-Content -LiteralPath $KeyFile -Raw).Trim())
+    if ($key.Length -ne 32) { throw "key file is not a 256-bit key: $KeyFile" }
+    Write-Host "Using existing key: $KeyFile"
+  } else {
+    $keyDir = Split-Path -Parent $KeyFile
+    if (-not (Test-Path -LiteralPath $keyDir)) { New-Item -ItemType Directory -Path $keyDir | Out-Null }
+    $key = New-Object byte[] 32
+    $rng = New-Object Security.Cryptography.RNGCryptoServiceProvider
+    $rng.GetBytes($key); $rng.Dispose()
+    [IO.File]::WriteAllText($KeyFile, [Convert]::ToBase64String($key), (New-Object Text.UTF8Encoding $false))
+    Write-Host "Created new key: $KeyFile"
+  }
+
+  # ---- read JSON ----
+  $j = Get-Content -LiteralPath $CredsFile -Raw | ConvertFrom-Json
+  $changed = $false
+  foreach ($k in 'clientId', 'clientSecret') {
+    $v = $j.$k
+    if (-not $v) { throw "missing $k in $CredsFile" }
+    if ($v -like 'dpapi:*') { throw "$k is DPAPI-encrypted; put the plain value back first" }
+    if ($v -like 'aes:*') { Write-Host "${k}: already encrypted"; continue }
+    $enc = Protect-Value $v $key
+    if ((Unprotect-Value $enc $key) -ne $v) { throw "round-trip check failed for $k - file left unchanged" }
+    $j.$k = $enc
+    $changed = $true
+    Write-Host "${k}: encrypted"
+  }
+
+  if (-not $changed) { Write-Host 'Nothing to do.'; exit 0 }
+
+  # ---- write JSON back: one property per line (the loader reads it line by line) ----
+  $lines = foreach ($p in $j.PSObject.Properties) {
+    if ($p.Value -isnot [string]) { throw "property $($p.Name) is not a string" }
+    $val = $p.Value.Replace('\', '\\').Replace('"', '\"')
+    '  "' + $p.Name + '": "' + $val + '"'
+  }
+  $text = "{`r`n" + ($lines -join ",`r`n") + "`r`n}`r`n"
+  [IO.File]::WriteAllText($CredsFile, $text, (New-Object Text.UTF8Encoding $false))
+  Write-Host "Done: $CredsFile"
+  Write-Host "Now: lock the Keys folder with NTFS permissions, and delete any plain copy of the secret."
+}
+catch {
+  Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+  exit 1
+}
