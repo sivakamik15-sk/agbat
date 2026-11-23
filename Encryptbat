@@ -1,0 +1,17 @@
+@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+REM ===============================================================
+REM  encrypt-creds.bat [path\to\clientcreds.json] [path\to\aes.key]
+REM  Starts encrypt-creds.ps1 (same folder). Encrypts clientId and clientSecret
+REM  in place with AES-256. The key goes to a separate file.
+REM  Defaults:  C:\NLG\Config\clientcreds.json   and   C:\NLG\Keys\aes.key
+REM  Run it once at setup, and again only when the secret is renewed.
+REM ===============================================================
+set "EC_CREDS=%~1"
+if not defined EC_CREDS set "EC_CREDS=C:\NLG\Config\clientcreds.json"
+set "EC_KEY=%~2"
+if not defined EC_KEY set "EC_KEY=C:\NLG\Keys\aes.key"
+if not exist "%~dp0encrypt-creds.ps1" (echo ERROR: encrypt-creds.ps1 must be in the same folder as this file. & exit /b 1)
+powershell -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "%~dp0encrypt-creds.ps1" -CredsFile "%EC_CREDS%" -KeyFile "%EC_KEY%"
+if errorlevel 1 (echo FAILED - credentials file left unchanged. & exit /b 1)
+exit /b 0
